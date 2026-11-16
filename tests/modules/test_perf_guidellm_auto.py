@@ -230,7 +230,7 @@ def test_flag_defaults_on():
 
 def test_auto_mode_takes_no_concurrencies():
     """Auto picks its own levels, so a config may leave the grid empty."""
-    for empty in (None, "", "0"):
+    for empty in (None, "", "0", 0):   # a bare YAML 0 is an int
         p = _auto_params(concurrencies=empty)
         assert p.concurrencies is None
         assert p.concurrency_levels() == []
@@ -240,6 +240,8 @@ def test_grid_mode_still_needs_concurrencies():
     with pytest.raises(ValueError, match="grid mode needs concurrencies"):
         PerfGuidellmSweepParams(search_mode="grid", concurrencies="")
     assert PerfGuidellmSweepParams().concurrencies == "1,2,4,8,16"
+    # A bare single level in YAML is an int too.
+    assert PerfGuidellmSweepParams(concurrencies=4).concurrencies == "4"
 
 
 def test_search_passes_at_cap(monkeypatch, tmp_path):

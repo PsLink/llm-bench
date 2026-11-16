@@ -29,7 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `perf_guidellm_sweep.concurrencies` may be empty (null, `""` or `0`) in auto
-  mode, which never reads it. Grid mode still requires it.
+  mode, which never reads it. Grid mode still requires it. A bare YAML number
+  (`concurrencies: 0`, `concurrencies: 4`) is read as its text instead of
+  being refused for not being a string.
 
 - The database URLs moved from the ConfigMap to the Secret: they carry the
   Postgres password.

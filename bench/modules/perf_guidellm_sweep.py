@@ -448,6 +448,15 @@ class PerfGuidellmSweepParams(BaseModel):
         ),
     )
 
+    @field_validator("concurrencies", mode="before")
+    @classmethod
+    def _concurrencies_as_text(cls, v):
+        # YAML reads `concurrencies: 0` or `concurrencies: 4` as a number, not
+        # the string this field holds; take the number as its text.
+        if isinstance(v, int) and not isinstance(v, bool):
+            return str(v)
+        return v
+
     @field_validator("concurrencies")
     @classmethod
     def _normalize_concurrencies(cls, v: Optional[str]) -> Optional[str]:
