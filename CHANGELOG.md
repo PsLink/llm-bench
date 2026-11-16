@@ -16,8 +16,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`secrets.serviceAccount=true`** creates the service account with a
   generated key, kept in the release's Secret as `SERVICE_API_KEY`, which LLM
   AutoTune in the same namespace reads directly.
+- **Auto-mode sweeps steer by total throughput** (`perf_guidellm_sweep`,
+  `bisect_by_total_tps`, on by default). A probe counts as passing only when it
+  meets the SLOs and its total TPS beats every lower level that passed. Past
+  the throughput peak a level can still meet loose SLOs while delivering fewer
+  tokens, and the SLO-only search reported such a level (say c44) over the
+  highest-throughput one (c40). The reported level is now the
+  highest-throughput level the search measured inside the SLOs. New metric
+  `search_tps_peak_concurrency`: the lowest level that met the SLOs without
+  raising throughput. Turn the flag off for the old SLO-only search.
 
 ### Changed
+
+- `perf_guidellm_sweep.concurrencies` may be empty (null, `""` or `0`) in auto
+  mode, which never reads it. Grid mode still requires it.
 
 - The database URLs moved from the ConfigMap to the Secret: they carry the
   Postgres password.

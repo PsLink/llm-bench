@@ -140,6 +140,7 @@ def test_sweep_only_metrics_stay_out_of_the_single_module():
         "peak_concurrency", "peak_input_tps", "peak_output_tps", "peak_total_tps",
         "reported_level_meets_slo", "slo_fail_concurrency", "duration_cap_seconds",
         "search_probes", "search_converged", "search_research_rounds",
+        "search_tps_peak_concurrency",
         "drain_wait_seconds", "pre_level_canary_ms", "started_drained",
     }
     # Everything else the sweep declares, the single module declares too

@@ -94,11 +94,12 @@ def test_next_bisect_level():
 # ---------------------------------------------------------------------------
 
 def _fake_probe(p, max_passing, fail_confirm_at=(), all_failed_levels=(),
-                abnormal_levels=()):
+                abnormal_levels=(), total_tps=None):
     """Build a _run_probe stand-in. A level passes the SLOs iff
     level <= max_passing — except confirmation runs (recognised by
     duration == p.max_seconds) for levels in fail_confirm_at, which produce
-    metrics that miss the TTFT cap."""
+    metrics that miss the TTFT cap. `total_tps(level)`, when given, replaces
+    the default throughput curve (150 tok/s per slot, rising forever)."""
     calls = []
     caps = []
     seeds = []
@@ -120,7 +121,7 @@ def _fake_probe(p, max_passing, fail_confirm_at=(), all_failed_levels=(),
         level_metrics = {
             "output_tps_mean": 50.0 * level,
             "input_tps_mean": 100.0 * level,
-            "total_tps_mean": 150.0 * level,
+            "total_tps_mean": total_tps(level) if total_tps else 150.0 * level,
             "ttft_p99_ms": 100.0 if passing else 999999.0,
             "request_output_tps": 50.0,
             "uptime": 1.0,
@@ -171,6 +172,74 @@ def test_search_converges_on_knee(monkeypatch, tmp_path):
     # per-level display rows include the new bookkeeping keys
     keys = {c["key"] for c in result.extra_display_configs}
     assert "c6.meets_slo" in keys and "c6.duration_cap_seconds" in keys
+
+
+def _peaked_at(peak):
+    """Throughput that rises to `peak` slots, then falls: past it, extra
+    concurrency only queues requests."""
+    return lambda level: 150.0 * min(level, peak) - 100.0 * max(level - peak, 0)
+
+
+def test_search_stops_at_the_throughput_peak(monkeypatch, tmp_path):
+    """Every level up to 12 meets the SLOs, but total throughput peaks at 5:
+    the search must not climb past the peak to the highest SLO-passing level,
+    and what it reports is the highest-throughput level it measured."""
+    p = _auto_params(search_granularity=1)
+    fake = _fake_probe(p, max_passing=12, total_tps=_peaked_at(5))
+    result = _run_auto(monkeypatch, tmp_path, p, fake)
+
+    # ramp 1,2,4 rise; 8 meets the SLOs but delivers less than c4 (450 < 600)
+    # → past the peak; bisect 6 (650 > 600 → rises), 7 (550 → past); confirm 6.
+    assert fake.calls == [(1, 5.0), (2, 5.0), (4, 5.0), (8, 5.0),
+                          (6, 5.0), (7, 5.0), (6, 6.0)]
+    m = result.metrics
+    assert m["reported_concurrency"] == 6
+    assert m["reported_concurrency"] == m["peak_concurrency"]
+    assert m["reported_level_meets_slo"] == 1.0
+    assert m["search_tps_peak_concurrency"] == 7.0
+    assert "slo_fail_concurrency" not in m   # nothing missed the SLOs
+
+
+def test_slo_only_search_when_the_flag_is_off(monkeypatch, tmp_path):
+    p = _auto_params(search_granularity=1, bisect_by_total_tps=False)
+    fake = _fake_probe(p, max_passing=12, total_tps=_peaked_at(5))
+    result = _run_auto(monkeypatch, tmp_path, p, fake)
+
+    m = result.metrics
+    assert m["reported_concurrency"] == 12      # the SLOs alone decide
+    assert m["peak_concurrency"] == 4           # ...though c4 delivered more
+    assert "search_tps_peak_concurrency" not in m
+
+
+def test_rising_throughput_changes_nothing(monkeypatch, tmp_path):
+    """While throughput keeps rising the flag is invisible: same probes, same
+    answer as an SLO-only search."""
+    calls = []
+    for flag in (True, False):
+        p = _auto_params(search_granularity=1, bisect_by_total_tps=flag)
+        fake = _fake_probe(p, max_passing=6)
+        result = _run_auto(monkeypatch, tmp_path, p, fake)
+        calls.append(fake.calls)
+        assert result.metrics["reported_concurrency"] == 6
+    assert calls[0] == calls[1]
+
+
+def test_flag_defaults_on():
+    assert _auto_params().bisect_by_total_tps is True
+
+
+def test_auto_mode_takes_no_concurrencies():
+    """Auto picks its own levels, so a config may leave the grid empty."""
+    for empty in (None, "", "0"):
+        p = _auto_params(concurrencies=empty)
+        assert p.concurrencies is None
+        assert p.concurrency_levels() == []
+
+
+def test_grid_mode_still_needs_concurrencies():
+    with pytest.raises(ValueError, match="grid mode needs concurrencies"):
+        PerfGuidellmSweepParams(search_mode="grid", concurrencies="")
+    assert PerfGuidellmSweepParams().concurrencies == "1,2,4,8,16"
 
 
 def test_search_passes_at_cap(monkeypatch, tmp_path):
