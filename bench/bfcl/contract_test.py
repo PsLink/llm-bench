@@ -164,11 +164,15 @@ def main():
             synchronize_cases = False
             expanded = BFCLV4Module().run(
                 EndpointConfig(endpoint, "fixture-model", "fixture-key"),
-                BFCLV4Params(task_set="bfcl-v4-tool-use-v1", probe_endpoint=True),
+                BFCLV4Params(
+                    task_set="bfcl-v4-tool-use-v1",
+                    cases_per_category=2,
+                    probe_endpoint=True,
+                ),
                 directory,
             )
             assert not expanded.error, expanded.error
-            assert expanded.metrics["case_count"] == 5
+            assert expanded.metrics["case_count"] == 10
             for category in (
                 "simple_python",
                 "multiple",
@@ -176,8 +180,13 @@ def main():
                 "irrelevance",
                 "multi_turn_base",
             ):
-                assert expanded.metrics[f"case_count_{category}"] == 1
+                assert expanded.metrics[f"case_count_{category}"] == 2
             expanded_attempt = Path(expanded.artifacts[0]).parent
+            manifest = json.loads((expanded_attempt / "manifest.json").read_text())
+            assert all(
+                ids == [f"{category}_0", f"{category}_1"]
+                for category, ids in manifest["cases"].items()
+            )
             probe = json.loads((expanded_attempt / "probe" / "probe.json").read_text())
             assert probe["case_id"] == "multi_turn_base_0"
             assert probe["tool_call_observed"] is True

@@ -130,3 +130,9 @@ class BFCLModuleTest(unittest.TestCase):
             self.assertEqual(phases, ["probe", "generate", "evaluate"])
             index = Path(result.artifacts[0])
             self.assertFalse((index.parent / "probe" / "config.json").exists())
+
+    def test_smoke_manifest_cannot_be_expanded(self):
+        from pydantic import ValidationError
+
+        with self.assertRaisesRegex(ValidationError, "smoke"):
+            BFCLV4Params(task_set="bfcl-v4-smoke-v1", cases_per_category=2)

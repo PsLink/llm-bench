@@ -14,7 +14,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from bench.modules.base import (
     BenchmarkCancelled,
@@ -34,8 +34,19 @@ MANIFESTS = {
 }
 
 
+# In the pinned BFCL revision, each of the five tool-use categories has
+# contiguous zero-based IDs and at least 200 official cases.
+MAX_TOOL_USE_CASES_PER_CATEGORY = 200
+
+
 class BFCLV4Params(BaseModel):
     task_set: Literal["bfcl-v4-smoke-v1", "bfcl-v4-tool-use-v1"] = "bfcl-v4-smoke-v1"
+    cases_per_category: int = Field(
+        1,
+        ge=1,
+        le=MAX_TOOL_USE_CASES_PER_CATEGORY,
+        description="Number of cases per category for bfcl-v4-tool-use-v1, selected by ascending case ID.",
+    )
     concurrency: int = Field(2, ge=1, le=128)
     request_timeout_seconds: float = Field(120, ge=1, le=3600)
     max_seconds: float = Field(1800, ge=1, le=86400)
@@ -49,6 +60,14 @@ class BFCLV4Params(BaseModel):
     min_ttft_coverage: float = Field(0, ge=0, le=1)
     min_usage_coverage: float = Field(0, ge=0, le=1)
     min_cache_usage_coverage: float = Field(0, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_case_count(self):
+        if self.task_set == "bfcl-v4-smoke-v1" and self.cases_per_category != 1:
+            raise ValueError(
+                "bfcl-v4-smoke-v1 has a fixed case count; use bfcl-v4-tool-use-v1 to select more"
+            )
+        return self
 
 
 def run_process(command, *, env, deadline, cancel_event):
@@ -183,6 +202,14 @@ class BFCLV4Module(TestModule):
             if url.scheme not in ("http", "https") or not url.hostname:
                 raise ValueError("BFCL requires an HTTP(S) endpoint")
             manifest = json.loads(MANIFESTS[params.task_set].read_text())
+            if params.cases_per_category > 1:
+                manifest["cases"] = {
+                    category: [
+                        f"{category}_{index}"
+                        for index in range(params.cases_per_category)
+                    ]
+                    for category in manifest["cases"]
+                }
             manifest.update(
                 concurrency=params.concurrency,
                 handler_version="llmbench-stream-v1",

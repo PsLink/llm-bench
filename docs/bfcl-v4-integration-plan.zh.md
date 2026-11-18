@@ -32,6 +32,7 @@ sequenceDiagram
 | 字段 | 语义 | 冒烟起点 |
 | --- | --- | --- |
 | `task_set` | worker 注册的 manifest 名，严格校验题目及依赖 | `bfcl-v4-smoke-v1` |
+| `cases_per_category` | 五类题集每类选取的题数，按固定 revision 的题号升序取前 N 道；冒烟题集固定 | 1 |
 | `concurrency` | 映射到官方 `--num-threads`，表示活跃题目上限 | 2 |
 | `request_timeout_seconds` | 单次模型调用的墙钟预算，包含本次调用的重试与退避 | 120 |
 | `max_seconds` | 模块总墙钟预算，包含探测、生成、评分和落盘 | 1800 |

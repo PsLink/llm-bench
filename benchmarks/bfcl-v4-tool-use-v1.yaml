@@ -11,6 +11,7 @@ modules:
     weight: 1.0
     params:
       task_set: bfcl-v4-tool-use-v1
+      cases_per_category: 1
       concurrency: 2
       request_timeout_seconds: 120
       max_seconds: 1800

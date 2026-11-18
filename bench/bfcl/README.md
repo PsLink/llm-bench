@@ -17,11 +17,15 @@ bfcl_rev=$("$bfcl_python" -c 'import json; print(json.load(open("bench/bfcl/smok
 
 ## 在 LLMBench worker 上运行
 
+从空白单机开始测试模块见 [Docker Compose 从零部署指南](../../docs/bfcl-v4-fresh-deployment.zh.md)。
+
 部署、真实端点和 Autotune 的逐步验收见 [生产验收执行指南](../../docs/bfcl-v4-production-acceptance.zh.md)。
 
 Linux AMD64 后端镜像会在构建时安装锁定的 BFCL 环境。依赖下载完成后，安装和 CLI 自检在无网络环境下进行。ARM64 镜像仍可运行其余模块。使用备用环境时，通过 `BFCL_PYTHON` 指向安装了固定 BFCL 版本的解释器。
 
 在管理端导入 [benchmark 配置](../../benchmarks/bfcl-v4-tool-use-v1.yaml)。模块默认的 `bfcl-v4-smoke-v1` 适合端点冒烟。benchmark 配置选择 `bfcl-v4-tool-use-v1`，覆盖参数、工具选择、并行调用、无关工具和多轮五类题。两套题集的 runner revision 一致，manifest 会记录实际并发、超时、重试和协议哈希。默认执行零预热和零重试。需要重试时设置 `request_retries`，仅在收到 HTTP 429 或 5xx 且流未打开时重试。
+
+五类题集支持 `cases_per_category`（1–200，默认 1）。它从固定 BFCL revision 的每类题目中按编号升序取前 N 道。设置 `cases_per_category: 2` 后正式评测共 10 题。实际题目 ID 写入 manifest 并参与协议哈希。比较候选时保持协议一致。冒烟题集和可选探测仍使用各自的固定题目。
 
 进度包括官方生成和评分两个阶段。设置 `required_metrics` 可阻止缺报指标进入排名，也可用 `min_ttft_coverage`、`min_usage_coverage` 和 `min_cache_usage_coverage` 设覆盖下限。缓存实测零满足覆盖要求。
 
