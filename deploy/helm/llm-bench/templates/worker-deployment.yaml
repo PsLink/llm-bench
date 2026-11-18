@@ -86,6 +86,10 @@ spec:
             - secretRef:
                 name: {{ include "llm-bench.fullname" . }}
           env:
+            {{- if .Values.bfclArtifacts.enabled }}
+            - name: BFCL_ARTIFACT_DIR
+              value: /var/lib/llmbench/bfcl
+            {{- end }}
             # Dramatiq claims messages at fetch time; prefetch > 1 lets a busy
             # (or draining) process hoard an unstarted submission for up to the
             # drain budget. See app.worker.queuePrefetch in values.yaml.
@@ -94,18 +98,31 @@ spec:
             {{- with .Values.app.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- if .Values.datasets.enabled }}
+          {{- if or .Values.datasets.enabled .Values.bfclArtifacts.enabled }}
           volumeMounts:
+            {{- if .Values.bfclArtifacts.enabled }}
+            - name: bfcl-artifacts
+              mountPath: /var/lib/llmbench/bfcl
+            {{- end }}
+            {{- if .Values.datasets.enabled }}
             - name: datasets
               mountPath: {{ .Values.datasets.mountPath }}
+            {{- end }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources.worker | nindent 12 }}
-      {{- if .Values.datasets.enabled }}
+      {{- if or .Values.datasets.enabled .Values.bfclArtifacts.enabled }}
       volumes:
+        {{- if .Values.bfclArtifacts.enabled }}
+        - name: bfcl-artifacts
+          persistentVolumeClaim:
+            claimName: {{ required "bfclArtifacts.existingClaim must name a shared ReadWriteMany PVC" .Values.bfclArtifacts.existingClaim }}
+        {{- end }}
+        {{- if .Values.datasets.enabled }}
         - name: datasets
           persistentVolumeClaim:
             claimName: {{ include "llm-bench.fullname" . }}-datasets
+        {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

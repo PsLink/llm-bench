@@ -99,6 +99,18 @@ jobs:
       - name: Run module tests
         run: uv run --no-sync --project platform/backend python -m pytest tests/modules/ -q
 
+  bfcl-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the locked BFCL environment
+        run: docker build --target bfcl-builder -f platform/backend/Dockerfile -t llmbench-bfcl-ci .
+      - name: Compare official streaming and non-streaming runs
+        run: |
+          docker run --rm --network none -v "${{ github.workspace }}:/app:ro" \
+            -w /app llmbench-bfcl-ci /opt/bfcl/bin/python -m bench.bfcl.contract_test
+
   # Migrations are applied automatically by the Helm hook, so a broken
   # migration = a broken deploy. The backend tests use Base.metadata.create_all
   # and never exercise them; this job does: `alembic upgrade head` on an empty

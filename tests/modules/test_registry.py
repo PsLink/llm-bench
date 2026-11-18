@@ -8,7 +8,7 @@ def test_registry_has_all_modules():
         "perf_guidellm", "perf_guidellm_sweep",
         "case_truncation", "opencompass",
         "replay", "agentic", "hallucination", "tool_call_success",
-        "functional_acceptance",
+        "functional_acceptance", "bfcl_v4",
     }
     assert set(MODULE_REGISTRY.keys()) == expected
 

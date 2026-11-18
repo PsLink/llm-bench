@@ -81,6 +81,7 @@ class EndpointConfig:
     model: str
     api_key: str = ""
     processor_path: str = ""
+    run_context: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

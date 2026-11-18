@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 
@@ -1312,9 +1313,12 @@ def _run_module_loop(
             # pinning autovacuum. expire_on_commit=False keeps the already-loaded
             # attributes usable afterwards, so this costs nothing.
             session.commit()
+            run_endpoint = replace(endpoint, run_context={
+                "submission_id": submission.id, "module_run_id": run.id,
+            }) if module_name == "bfcl_v4" else endpoint
             try:
                 result = module_cls().run(
-                    endpoint=endpoint,
+                    endpoint=run_endpoint,
                     params=params,
                     output_dir=os.path.join(output_dir, dir_suffix),
                     progress_cb=progress_cb,
@@ -1322,7 +1326,7 @@ def _run_module_loop(
                 )
             except TypeError:
                 result = module_cls().run(
-                    endpoint=endpoint,
+                    endpoint=run_endpoint,
                     params=params,
                     output_dir=os.path.join(output_dir, dir_suffix),
                     progress_cb=progress_cb,
@@ -1338,6 +1342,14 @@ def _run_module_loop(
                 metric_configs = [asdict(mc) for mc in module_cls.default_metric_configs]
             metric_configs = _merge_extra_display_configs(metric_configs, result)
 
+            if module_name == "bfcl_v4":
+                from bench.modules.evaluator import resolve_metric
+                for config in metric_configs:
+                    if (not result.error and config.get("role") in {"score", "redline"}
+                            and resolve_metric(result.metrics, config["key"]) is None):
+                        result.error = f"BFCL required benchmark metric unavailable: {config['key']}"
+                        break
+                _persist_bfcl_artifacts(result, submission.id, run.id)
             if result.error:
                 result.score = 0.0
                 result.passed = False
@@ -1349,7 +1361,12 @@ def _run_module_loop(
                 "Submission %d module %s done — passed=%s score=%.4f",
                 submission.id, module_name, result.passed, result.score,
             )
-        except (SubmissionCancelled, BenchmarkCancelled):
+        except (SubmissionCancelled, BenchmarkCancelled) as exc:
+            artifacts = getattr(exc, "artifacts", [])
+            if module_name == "bfcl_v4" and artifacts:
+                diagnostic = ModuleResult(artifacts=artifacts)
+                _persist_bfcl_artifacts(diagnostic, submission.id, run.id)
+                run.artifact_path = diagnostic.artifacts[0]
             # The module was handed one event for both signals, so disambiguate:
             # a blown time cap is a module FAILURE worth surfacing, not a cancel.
             if timed_out is not None and timed_out.is_set():
@@ -1491,9 +1508,24 @@ def _fail_submission(session, submission, error: str) -> None:
     session.commit()
 
 
+def _persist_bfcl_artifacts(result, submission_id, run_id):
+    from app.core.bfcl_artifacts import persist_artifacts
+
+    if not result.artifacts or not settings.BFCL_ARTIFACT_DIR:
+        return
+    try:
+        archive = persist_artifacts(settings.BFCL_ARTIFACT_DIR, submission_id, run_id, result.artifacts[0])
+    except (OSError, ValueError):
+        logger.exception("Could not persist BFCL artifacts for run %d", run_id)
+        result.error = result.error or "Could not persist BFCL artifacts"
+    else:
+        result.artifacts[0] = str(archive)
+
+
 def _complete_run(session, run, result: ModuleResult, metric_configs: list | None = None) -> None:
     from app.db.models import ModuleRunStatus
-    run.status = ModuleRunStatus.DONE
+    failed = run.module_name == "bfcl_v4" and bool(result.error)
+    run.status = ModuleRunStatus.FAILED if failed else ModuleRunStatus.DONE
     run.score = result.score
     run.passed = result.passed
     run.metrics_json = result.metrics
@@ -1507,7 +1539,7 @@ def _complete_run(session, run, result: ModuleResult, metric_configs: list | Non
         "event": "run_complete",
         "run_id": run.id,
         "module_name": run.module_name,
-        "status": "done",
+        "status": "failed" if failed else "done",
         "score": result.score,
         "passed": result.passed,
         "metrics": result.metrics,
