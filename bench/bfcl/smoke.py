@@ -97,6 +97,7 @@ def main():
         license="",
         model_handler=SmokeHandler,
         is_fc_model=True,
+        underscore_to_dot=True,
     )
     cli(
         [

@@ -138,6 +138,9 @@ class BFCLV4Module(TestModule):
             ("successful_request_rps", "req/s", True),
             ("input_tokens_per_second", "tok/s", True),
             ("output_tokens_per_second", "tok/s", True),
+            ("input_tpm", "tok/min", True),
+            ("output_tpm", "tok/min", True),
+            ("total_tpm", "tok/min", True),
             ("cache_hit_rate", "", True),
             ("cached_input_tokens", "tok", True),
             ("passed_cases_per_hour", "cases/h", True),
@@ -212,7 +215,7 @@ class BFCLV4Module(TestModule):
                 }
             manifest.update(
                 concurrency=params.concurrency,
-                handler_version="llmbench-stream-v1",
+                handler_version="llmbench-stream-v2",
                 request_timeout_seconds=params.request_timeout_seconds,
                 retry_policy={
                     "max_retries": params.request_retries,

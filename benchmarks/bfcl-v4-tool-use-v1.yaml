@@ -29,6 +29,12 @@ modules:
         role: display
       - key: ttft_p90_ms
         role: display
+      - key: input_tpm
+        role: display
+      - key: output_tpm
+        role: display
+      - key: total_tpm
+        role: display
       - key: cache_hit_rate
         role: display
       - key: cache_usage_coverage

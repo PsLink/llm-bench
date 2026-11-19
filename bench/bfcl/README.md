@@ -41,6 +41,10 @@ Docker Compose 通过共享卷保留 attempt 压缩包。Helm 部署通过 `bfcl
 
 CI 在无外网的容器里运行 `python -m bench.bfcl.contract_test`，使用回环模拟服务核对同一题集的非流式与流式官方评分、请求认证、工具调用 ID 回填、并发重叠和题内请求顺序。
 
+`llmbench-stream-v2` 启用官方评分器的 `underscore_to_dot` 配置，使评分时的预期函数名与 OpenAI 工具定义中的点号转下划线规则一致。契约测试覆盖单工具、工具选择和并行调用中的带点函数名。旧版结果可能因此低估准确率，应新建提交复测；handler 版本参与 `protocol_hash`，新旧结果的协议哈希不同。
+
+`input_tpm` 和 `output_tpm` 分别为现有输入、输出 token/s 的 60 倍，使用正式生成阶段的总墙钟时间（包含并发和多轮等待，不含评分、探测时间）。缺报时应结合对应的 usage coverage 判断；没有样本或生成时长不可用时返回 null。`total_tpm` 是二者之和，仅在输入和输出 usage 覆盖率均为 100% 时提供，避免把部分上报数据当作完整总吞吐。三项均为展示指标，不影响准确率评分。
+
 闭环 cache off/on 对照须在两套已验证的服务配置上重复运行。核对两臂的 manifest `protocol_hash`，并记录模型部署标识、缓存开关和执行顺序。对比时同时看分项准确率、请求数、token 用量和缓存覆盖。
 
 固定请求对照可以先开启 `export_replay_trace`，将一次生成的 `trace.jsonl` 冻结到 Replay 数据目录，在两个候选的 Replay 模块配置中使用同一路径、并发、样本数和请求选项。使用 `summary.json` 中的 `trace_sha256` 核对文件，再检查 `trace-index.jsonl` 中的请求序号和请求体哈希。Replay 的 `cache_hit_rate` 以同时报告输入和缓存用量的成功请求为分母，`cache_usage_coverage` 显示覆盖比例。这里的 Replay 按独立请求调度。如需验证多轮前缀复用的因果时序，仍需按 case 调度请求。

@@ -80,9 +80,18 @@ def aggregate_metrics(events, wall_seconds=None):
         result[f"{name}_tokens_per_second"] = (
             sum(values) / wall_seconds if values and wall_seconds else None
         )
+        rate = result[f"{name}_tokens_per_second"]
+        result[f"{name}_tpm"] = rate * 60 if rate is not None else None
         result[f"{field}_total"] = (
             sum(values) if values and len(values) == count else None
         )
+    result["total_tpm"] = (
+        result["input_tpm"] + result["output_tpm"]
+        if result["input_tpm"] is not None
+        and result["output_tpm"] is not None
+        and result["input_usage_coverage"] == result["output_usage_coverage"] == 1
+        else None
+    )
     ttft = [e["ttft_seconds"] for e in successes if e.get("ttft_seconds") is not None]
     e2e = [
         e["latency_seconds"] for e in successes if e.get("latency_seconds") is not None

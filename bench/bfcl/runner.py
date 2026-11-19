@@ -255,6 +255,8 @@ def run_phase(phase, root):
             OpenAICompletionsHandler, config, root, phase=phase
         ),
         is_fc_model=True,
+        # Match the dot-to-underscore conversion in OpenAI tool schemas.
+        underscore_to_dot=True,
     )
     if phase in {"probe", "generate"}:
         (root / "test_case_ids_to_generate.json").write_text(

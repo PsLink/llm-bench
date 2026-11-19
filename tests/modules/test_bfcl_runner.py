@@ -9,6 +9,40 @@ from bench.bfcl.trace import TraceWriter
 
 
 class RunnerTests(unittest.TestCase):
+    def test_tpm_uses_generation_wall_time_and_excludes_probe(self):
+        events = [
+            {"status": "success", "prompt_tokens": 100, "completion_tokens": 10},
+            {"status": "success", "prompt_tokens": 200, "completion_tokens": 20},
+            {"phase": "probe", "status": "success", "prompt_tokens": 999,
+             "completion_tokens": 999},
+        ]
+        metrics = aggregate_metrics(events, wall_seconds=30)
+        self.assertEqual(metrics["input_tpm"], 600)
+        self.assertEqual(metrics["output_tpm"], 60)
+        self.assertEqual(metrics["total_tpm"], 660)
+
+    def test_tpm_partial_usage_does_not_produce_complete_total(self):
+        metrics = aggregate_metrics(
+            [
+                {"status": "success", "prompt_tokens": 100, "completion_tokens": None},
+                {"status": "success", "prompt_tokens": 200, "completion_tokens": 20},
+            ],
+            wall_seconds=30,
+        )
+        self.assertEqual(metrics["input_tpm"], 600)
+        self.assertEqual(metrics["output_tpm"], 40)
+        self.assertEqual(metrics["output_usage_coverage"], 0.5)
+        self.assertIsNone(metrics["total_tpm"])
+
+    def test_tpm_distinguishes_measured_zero_from_missing_data(self):
+        zero = [{"status": "success", "prompt_tokens": 0, "completion_tokens": 0}]
+        for key in ("input_tpm", "output_tpm", "total_tpm"):
+            self.assertEqual(aggregate_metrics(zero, 30)[key], 0)
+            for events, duration in (([], 30), (zero, None), (zero, 0),
+                                     ([{"status": "success"}], 30)):
+                with self.subTest(key=key, events=events, duration=duration):
+                    self.assertIsNone(aggregate_metrics(events, duration)[key])
+
     def test_score_failure_rows_define_case_results_with_exact_header(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

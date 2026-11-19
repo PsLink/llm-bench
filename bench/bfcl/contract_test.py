@@ -32,6 +32,14 @@ def main():
                 rendezvous.wait()
             if triangle:
                 name, args = "calculate_triangle_area", '{"base":10,"height":5}'
+            elif "math_factorial" in tool_names:
+                name, args = "math_factorial", '{"number":5}'
+            elif "triangle_properties_get" in tool_names:
+                name, args = "triangle_properties_get", '{"side1":5,"side2":4,"side3":3}'
+            elif "math_triangle_area_heron" in tool_names:
+                name, args = "math_triangle_area_heron", '{"side1":3,"side2":4,"side3":5}'
+            elif "spotify_play" in tool_names:
+                name, args = "spotify_play", '{"artist":"Taylor Swift","duration":20}'
             elif multi_turn and not any(
                 message["role"] == "tool" for message in messages
             ):
@@ -51,6 +59,18 @@ def main():
                 if name
                 else None
             )
+            calls = [call] if call else []
+            if name == "spotify_play":
+                calls.append(
+                    {
+                        "id": "fixture-call-2",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": '{"artist":"Maroon 5","duration":15}',
+                        },
+                    }
+                )
             reason = "tool_calls" if name else "stop"
             meta = {"id": "fixture-response", "created": 0, "model": body["model"]}
             usage = {
@@ -65,7 +85,12 @@ def main():
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
                 if call:
-                    pieces = [{"tool_calls": [{"index": 0, **call}]}]
+                    pieces = [
+                        {"tool_calls": [
+                            {"index": index, **item}
+                            for index, item in enumerate(calls)
+                        ]}
+                    ]
                 else:
                     pieces = [{"content": "Done."}]
                 chunks = [
@@ -85,7 +110,7 @@ def main():
                 self.end_headers()
                 msg = {"role": "assistant", "content": None if call else "Done."}
                 if call:
-                    msg["tool_calls"] = [call]
+                    msg["tool_calls"] = calls
                 self.wfile.write(
                     json.dumps(
                         {
@@ -120,6 +145,8 @@ def main():
             metrics = result.metrics
             assert metrics["accuracy"] == 0.5, metrics
             assert metrics["accuracy_simple_python"] == 1
+            assert metrics["input_tpm"] > 0 and metrics["output_tpm"] > 0
+            assert metrics["total_tpm"] == metrics["input_tpm"] + metrics["output_tpm"]
             assert (
                 metrics["cache_usage_coverage"] == 1 and metrics["cache_hit_rate"] == 0
             )
@@ -173,6 +200,11 @@ def main():
             )
             assert not expanded.error, expanded.error
             assert expanded.metrics["case_count"] == 10
+            # OpenAI tool names replace dots with underscores. The official
+            # evaluator must apply the same conversion to its expected names.
+            assert expanded.metrics["accuracy_simple_python"] == 1, expanded.metrics
+            assert expanded.metrics["accuracy_multiple"] == 1, expanded.metrics
+            assert expanded.metrics["accuracy_parallel"] == 0.5, expanded.metrics
             for category in (
                 "simple_python",
                 "multiple",
@@ -183,6 +215,7 @@ def main():
                 assert expanded.metrics[f"case_count_{category}"] == 2
             expanded_attempt = Path(expanded.artifacts[0]).parent
             manifest = json.loads((expanded_attempt / "manifest.json").read_text())
+            assert manifest["handler_version"] == "llmbench-stream-v2"
             assert all(
                 ids == [f"{category}_0", f"{category}_1"]
                 for category, ids in manifest["cases"].items()
