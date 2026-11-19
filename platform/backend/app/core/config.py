@@ -21,6 +21,9 @@ def find_bench_dir(start: Path) -> Path:
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    # Shared worker/backend path for downloadable BFCL attempt archives.
+    BFCL_ARTIFACT_DIR: str = ""
+
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/llmbench"
     DATABASE_URL_SYNC: str = "postgresql://postgres:postgres@localhost:5432/llmbench"

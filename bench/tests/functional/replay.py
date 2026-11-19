@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import requests
 
+from bench.cache_usage import cache_metrics, cache_usage
 from bench.replay_test.jsonl_io import count_lines
 from bench.replay_test.log_replay_tool import (
     MatchedRequest,
@@ -1013,7 +1014,7 @@ class ReplayTest(BaseTest):
         response_bytes = 0
         prompt_tokens = 0
         completion_tokens = 0
-        cached_tokens = 0
+        cached_tokens = None
         output_tps = 0.0
         input_tps = 0.0
         tokens_after_finish = 0
@@ -1043,7 +1044,7 @@ class ReplayTest(BaseTest):
             response_bytes = 0
             prompt_tokens = 0
             completion_tokens = 0
-            cached_tokens = 0
+            cached_tokens = None
             tokens_after_finish = 0
             finish_reason = None
             stop_reason = None
@@ -1150,22 +1151,9 @@ class ReplayTest(BaseTest):
                                 has_usage = True
                             if usage.get("prompt_tokens"):
                                 prompt_tokens = usage["prompt_tokens"]
-                            # Cached prompt tokens. Spelling differs by vendor — check
-                            # known shapes in priority order; default 0 if absent.
-                            cached_val = None
-                            details = usage.get("prompt_tokens_details")
-                            if isinstance(details, dict):
-                                cached_val = details.get("cached_tokens")
-                            if cached_val is None:
-                                cached_val = (
-                                    usage.get("cached_tokens")
-                                    or usage.get("prompt_cache_hit_tokens")
-                                )
-                            if cached_val:
-                                try:
-                                    cached_tokens = int(cached_val)
-                                except (TypeError, ValueError):
-                                    pass
+                            _, reported_cached = cache_usage(usage)
+                            if reported_cached is not None:
+                                cached_tokens = reported_cached
 
                         for choice in data.get("choices", []):
                             delta = choice.get("delta", {})
@@ -1927,7 +1915,7 @@ class ReplayTest(BaseTest):
         # stays at 0 and total_input_tokens is the raw prompt_tokens sum.
         total_input_tokens = sum(r.get("prompt_tokens", 0) for r in successes)
         total_output_tokens = sum(r.get("completion_tokens", 0) for r in successes)
-        total_cached_tokens = sum(r.get("cached_tokens", 0) for r in successes)
+        total_cached_tokens = sum((r.get("cached_tokens") or 0) for r in successes)
         # Cached tokens are a SUBSET of prompt_tokens (the cache-hit portion), so
         # total_input_tokens already includes them. For cost models that price
         # cache reads separately, the fresh/full-price portion is input minus
@@ -2013,7 +2001,7 @@ class ReplayTest(BaseTest):
             "total_uncached_input_tokens": total_uncached_input_tokens,
             # Token-weighted cache hit rate in [0,1] (cached ⊆ input). None when
             # no input tokens were counted (nothing to divide).
-            "cache_hit_rate": (total_cached_tokens / total_input_tokens) if total_input_tokens > 0 else None,
+            **cache_metrics(successes),
             "wall_time_s": effective_wall_s if effective_wall_s > 0 else None,
             "input_tpm": input_tpm,
             "output_tpm": output_tpm,

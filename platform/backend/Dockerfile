@@ -31,6 +31,48 @@ ENV UV_LINK_MODE=copy
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 
+# BFCL owns a separate environment because its NumPy/filelock pins differ.
+# Downloads and build-tool bootstrap may use the network. Installation into the
+# final BFCL environment, source-package builds, and CLI checks run offline.
+FROM python:3.12-slim AS bfcl-builder
+ARG TARGETARCH
+ARG BFCL_PIP_INDEX_URL=https://pypi.org/simple
+ARG BFCL_PIP_TIMEOUT=120
+ENV PIP_INDEX_URL=${BFCL_PIP_INDEX_URL} PIP_DEFAULT_TIMEOUT=${BFCL_PIP_TIMEOUT}
+COPY bench/bfcl/requirements.lock /tmp/bfcl-requirements.lock
+# The BFCL lock covers the x86_64 CPU workers. Keep the existing arm64
+# backend release usable for all other modules.
+RUN mkdir -p /opt/bfcl \
+    && if [ "$TARGETARCH" = amd64 ]; then \
+      apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+      && rm -rf /var/lib/apt/lists/* \
+      && grep -E '^(setuptools|wheel|packaging)==' /tmp/bfcl-requirements.lock \
+           > /tmp/bfcl-bootstrap.lock \
+      && python -m pip install --require-hashes --no-deps -r /tmp/bfcl-bootstrap.lock \
+      && python -m pip download --require-hashes --only-binary=:all: \
+        --no-binary=google-search-results --no-build-isolation \
+        -r /tmp/bfcl-requirements.lock -d /wheels \
+      && git init /bfcl-source \
+      && git -C /bfcl-source fetch --depth=1 https://github.com/ShishirPatil/gorilla.git \
+           6ea57973c7a6097fd7c5915698c54c17c5b1b6c8 \
+      && git -C /bfcl-source checkout --detach FETCH_HEAD; \
+    fi
+RUN --network=none if [ "$TARGETARCH" = amd64 ]; then \
+      sed -E 's|^torch @ [^ ]+ |torch==2.14.0+cpu |' \
+        /tmp/bfcl-requirements.lock > /tmp/bfcl-offline.lock \
+      && python -m venv /opt/bfcl \
+      && /opt/bfcl/bin/pip install --no-index --find-links=/wheels --no-deps \
+        --require-hashes -r /tmp/bfcl-bootstrap.lock \
+      && /opt/bfcl/bin/pip install --no-index --find-links=/wheels --no-build-isolation \
+        --require-hashes -r /tmp/bfcl-offline.lock \
+      && git -C /bfcl-source rev-parse HEAD > /opt/bfcl/llmbench-bfcl-revision \
+      && /opt/bfcl/bin/pip install --no-index --no-deps --no-build-isolation \
+        /bfcl-source/berkeley-function-call-leaderboard \
+      && /opt/bfcl/bin/pip check \
+      && /opt/bfcl/bin/python -m bfcl_eval generate --help \
+      && /opt/bfcl/bin/python -m bfcl_eval evaluate --help; \
+    fi
+
 # ---------------------------------------------------------------------------
 # The tokenizer the throughput modules size their prompts with
 # ---------------------------------------------------------------------------
@@ -56,6 +98,8 @@ COPY --from=ghcr.io/astral-sh/uv:0.9.22 /uv /usr/local/bin/uv
 
 # Copy installed packages from builder
 COPY --from=builder /app/.venv /app/.venv
+COPY --from=bfcl-builder /opt/bfcl /opt/bfcl
+ENV BFCL_PYTHON="/opt/bfcl/bin/python"
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Copy source — repo root is the build context
