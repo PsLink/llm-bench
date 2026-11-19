@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Type
 
+from bench.modules.bfcl_v4 import BFCLV4Module
 from bench.modules.base import TestModule  # noqa: F401 (re-exported)
 from bench.modules.perf_guidellm import PerfGuidellmModule
 from bench.modules.perf_guidellm_sweep import PerfGuidellmSweepModule
@@ -28,6 +29,7 @@ from bench.modules.tool_call_success import ToolCallSuccessModule
 from bench.modules.functional_acceptance import FunctionalAcceptanceModule
 
 MODULE_REGISTRY: Dict[str, Type[TestModule]] = {
+    BFCLV4Module.name: BFCLV4Module,
     PerfGuidellmModule.name:      PerfGuidellmModule,
     PerfGuidellmSweepModule.name: PerfGuidellmSweepModule,
     CaseTruncationModule.name: CaseTruncationModule,

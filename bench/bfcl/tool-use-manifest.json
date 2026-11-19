@@ -1,0 +1,13 @@
+{
+  "name": "bfcl-v4-tool-use-v1",
+  "revision": "6ea57973c7a6097fd7c5915698c54c17c5b1b6c8",
+  "temperature": 0.001,
+  "concurrency": 2,
+  "cases": {
+    "simple_python": ["simple_python_0"],
+    "multiple": ["multiple_0"],
+    "parallel": ["parallel_0"],
+    "irrelevance": ["irrelevance_0"],
+    "multi_turn_base": ["multi_turn_base_0"]
+  }
+}

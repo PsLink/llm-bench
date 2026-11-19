@@ -513,3 +513,10 @@ initContainer:
     registry: docker.io
     repository: library/busybox
     tag: "1.36"
+
+
+# Optional shared volume for downloadable BFCL archives. Use a dedicated RWX
+# claim accessible to backend and worker pods. Manage retention on that volume.
+bfclArtifacts:
+  enabled: false
+  existingClaim: ""

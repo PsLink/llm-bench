@@ -10,7 +10,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -804,6 +804,31 @@ async def _get_worker_log_body(
         if body is None:
             raise _LOG_NOT_READY
         return etag, body  # type: ignore[return-value]
+
+
+@router.get("/{submission_id}/runs/{run_id}/artifacts")
+async def download_bfcl_artifacts(
+    submission_id: int,
+    run_id: int,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
+):
+    from app.core.bfcl_artifacts import downloadable_artifact
+
+    row = (await session.execute(
+        select(Submission.user_id, SubmissionRun.artifact_path)
+        .join(SubmissionRun, SubmissionRun.submission_id == Submission.id)
+        .where(Submission.id == submission_id, SubmissionRun.id == run_id,
+               SubmissionRun.module_name == "bfcl_v4")
+    )).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="BFCL run not found")
+    if row[0] != user.id and not is_admin_or_above(user.role):
+        raise HTTPException(status_code=403, detail="Access denied")
+    path = downloadable_artifact(settings.BFCL_ARTIFACT_DIR, submission_id, run_id, row[1])
+    if path is None:
+        raise HTTPException(status_code=404, detail="BFCL artifact archive is unavailable")
+    return FileResponse(path, media_type="application/gzip", filename=f"bfcl-{submission_id}-{run_id}.tar.gz")
 
 
 @router.get("/{submission_id}/logs/download")

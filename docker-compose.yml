@@ -25,12 +25,14 @@ x-backend: &backend
     REDIS_URL: redis://redis:6379/0
     SECRET_KEY: ${SECRET_KEY:?set in .env}
     PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?set in .env}
+    BFCL_ARTIFACT_DIR: /var/lib/llmbench/bfcl
     ROOT_PATH: /api
     ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8080}
   volumes:
     # Fetched datasets (scripts/fetch_academic_datasets.py) and your own replay
     # captures. The examples every module defaults to are inside the image.
     - ./dataset:/app/dataset:ro
+    - bfcl_artifacts:/var/lib/llmbench/bfcl
 
 services:
   postgres:
@@ -123,4 +125,5 @@ services:
     restart: unless-stopped
 
 volumes:
+  bfcl_artifacts:
   postgres_data:
