@@ -136,3 +136,52 @@ class BFCLModuleTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValidationError, "smoke"):
             BFCLV4Params(task_set="bfcl-v4-smoke-v1", cases_per_category=2)
+
+    def test_long_context_task_set_runs_only_selected_cases(self):
+        hashes = set()
+        for count in (1, 2, 200):
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as directory:
+                manifests = []
+
+                def fake(command, **kwargs):
+                    root = Path(command[-1])
+                    config = json.loads((root / "config.json").read_text())
+                    manifests.append(config["manifest"])
+                    if command[-3] == "evaluate":
+                        (root / "summary.json").write_text(json.dumps({"metrics": {
+                            "accuracy": 1.0,
+                            "accuracy_multi_turn_long_context": 1.0,
+                            "case_count_multi_turn_long_context": count,
+                        }}))
+
+                with patch("bench.modules.bfcl_v4.run_process", side_effect=fake):
+                    result = BFCLV4Module().run(
+                        EndpointConfig("http://localhost/v1", "m"),
+                        BFCLV4Params(
+                            task_set="bfcl-v4-multi-turn-long-context-v1",
+                            cases_per_category=count,
+                            required_metrics=["accuracy_multi_turn_long_context"],
+                        ),
+                        directory,
+                    )
+                self.assertIsNone(result.error)
+                self.assertEqual(len(manifests), 2)
+                for manifest in manifests:
+                    self.assertEqual(manifest["cases"], {
+                        "multi_turn_long_context": [
+                            f"multi_turn_long_context_{index}" for index in range(count)
+                        ],
+                    })
+                self.assertEqual(result.metrics["case_count_multi_turn_long_context"], count)
+                hashes.add(manifests[0]["protocol_hash"])
+        self.assertEqual(len(hashes), 3)
+
+    def test_long_context_case_count_bounds(self):
+        from pydantic import ValidationError
+
+        for count in (0, 201):
+            with self.subTest(count=count), self.assertRaises(ValidationError):
+                BFCLV4Params(
+                    task_set="bfcl-v4-multi-turn-long-context-v1",
+                    cases_per_category=count,
+                )

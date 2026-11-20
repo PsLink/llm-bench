@@ -31,21 +31,26 @@ MANIFEST_DIR = Path(__file__).parents[1] / "bfcl"
 MANIFESTS = {
     "bfcl-v4-smoke-v1": MANIFEST_DIR / "smoke-manifest.json",
     "bfcl-v4-tool-use-v1": MANIFEST_DIR / "tool-use-manifest.json",
+    "bfcl-v4-multi-turn-long-context-v1": MANIFEST_DIR / "multi-turn-long-context-manifest.json",
 }
 
 
-# In the pinned BFCL revision, each of the five tool-use categories has
+# In the pinned BFCL revision, the tool-use and long-context categories have
 # contiguous zero-based IDs and at least 200 official cases.
 MAX_TOOL_USE_CASES_PER_CATEGORY = 200
 
 
 class BFCLV4Params(BaseModel):
-    task_set: Literal["bfcl-v4-smoke-v1", "bfcl-v4-tool-use-v1"] = "bfcl-v4-smoke-v1"
+    task_set: Literal[
+        "bfcl-v4-smoke-v1",
+        "bfcl-v4-tool-use-v1",
+        "bfcl-v4-multi-turn-long-context-v1",
+    ] = "bfcl-v4-smoke-v1"
     cases_per_category: int = Field(
         1,
         ge=1,
         le=MAX_TOOL_USE_CASES_PER_CATEGORY,
-        description="Number of cases per category for bfcl-v4-tool-use-v1, selected by ascending case ID.",
+        description="Number of cases per category for tool-use and multi-turn-long-context task sets, selected by ascending case ID.",
     )
     concurrency: int = Field(2, ge=1, le=128)
     request_timeout_seconds: float = Field(120, ge=1, le=3600)
@@ -125,6 +130,7 @@ class BFCLV4Module(TestModule):
             ("accuracy", "", True),
             ("accuracy_simple_python", "", True),
             ("accuracy_multi_turn_base", "", True),
+            ("accuracy_multi_turn_long_context", "", True),
             ("accuracy_multiple", "", True),
             ("accuracy_parallel", "", True),
             ("accuracy_irrelevance", "", True),
@@ -153,6 +159,7 @@ class BFCLV4Module(TestModule):
             ("case_count", "", True),
             ("case_count_simple_python", "", True),
             ("case_count_multi_turn_base", "", True),
+            ("case_count_multi_turn_long_context", "", True),
             ("case_count_multiple", "", True),
             ("case_count_parallel", "", True),
             ("case_count_irrelevance", "", True),

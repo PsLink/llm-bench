@@ -31,6 +31,8 @@ Linux AMD64 后端镜像会在构建时安装锁定的 BFCL 环境。依赖下�
 
 五类题集支持 `cases_per_category`（1–200，默认 1）。它从固定 BFCL revision 的每类题目中按编号升序取前 N 道。设置 `cases_per_category: 2` 后正式评测共 10 题。实际题目 ID 写入 manifest 并参与协议哈希。比较候选时保持协议一致。冒烟题集和可选探测仍使用各自的固定题目。
 
+单独评测长上下文多轮工具调用时，选择 `task_set: bfcl-v4-multi-turn-long-context-v1`，或导入[独立 benchmark 配置](../../benchmarks/bfcl-v4-multi-turn-long-context-v1.yaml)。此题集只包含 `multi_turn_long_context`，使用相同固定 BFCL revision，支持 `cases_per_category: 1–200`（默认 1），按编号升序取前 N 题，总题数为 N。分项指标为 `accuracy_multi_turn_long_context` 和 `case_count_multi_turn_long_context`。长上下文主要在工具返回后累积；运行更多题目时应按端点性能调整 `max_seconds`。若开启 `probe_endpoint`，仍会额外执行独立的 `multi_turn_base_0` 探测，该题不计入正式评测。
+
 进度包括官方生成和评分两个阶段。设置 `required_metrics` 可阻止缺报指标进入排名，也可用 `min_ttft_coverage`、`min_usage_coverage` 和 `min_cache_usage_coverage` 设覆盖下限。缓存实测零满足覆盖要求。
 
 Docker Compose 通过共享卷保留 attempt 压缩包。Helm 部署通过 `bfclArtifacts.enabled=true` 和 `bfclArtifacts.existingClaim` 挂载现有 RWX PVC。配置共享卷的部署可由提交者或管理员请求 `GET /submissions/{submission_id}/runs/{run_id}/artifacts` 下载。归档保留期限由部署侧的存储策略管理。
