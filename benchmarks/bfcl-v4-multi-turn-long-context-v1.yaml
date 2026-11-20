@@ -10,8 +10,8 @@ modules:
     weight: 1.0
     params:
       task_set: bfcl-v4-multi-turn-long-context-v1
-      cases_per_category: 1
-      concurrency: 2
+      cases_per_category: 200
+      concurrency: 1
       request_timeout_seconds: 120
       max_seconds: 1800
       required_metrics: [accuracy, passed_cases_per_hour, ttft_p90_ms]
