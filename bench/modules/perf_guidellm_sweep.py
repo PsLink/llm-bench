@@ -32,6 +32,15 @@ params restores pure duration-limited levels.
     short probes from the full confirmation run, so peak_* aggregates
     compare mixed sample sizes in auto mode).
 
+    Total throughput is the search's monotone metric too
+    (`bisect_by_total_tps`, on by default): a probe only counts as passing
+    when it meets the SLOs AND its total TPS beats every lower level that
+    passed. Past the throughput peak, more concurrency only queues requests
+    — it can still meet loose SLOs while delivering fewer tokens, and an
+    SLO-only search would then report a level above the one with the most
+    throughput. Such a level is treated as failing, so the bracket closes on
+    the throughput peak inside the SLOs.
+
     Two things keep consecutive runs from contaminating each other, both
     learned from a search whose c=32 probe passed with a 2s TTFT and whose
     c=32 confirmation then failed at 30s:
@@ -215,14 +224,15 @@ class PerfGuidellmSweepParams(BaseModel):
             "`concurrencies` and always reports the confirmed level."
         ),
     )
-    concurrencies: str = Field(
+    concurrencies: Optional[str] = Field(
         default=_DEFAULT_CONCURRENCIES,
         json_schema_extra=_GRID_ONLY,
         description=(
             "[grid] Comma-separated concurrency levels to sweep, strictly "
             "increasing, e.g. '1,2,4,8,16'. Each level runs sequentially, so "
             "total runtime ≈ levels × (warmup_seconds + level duration). "
-            "Ignored when search_mode='auto', which picks its own levels."
+            "Required in grid mode. Not used when search_mode='auto', which "
+            "picks its own levels — leave it empty there."
         ),
     )
     input_tokens: int = Field(default=50000, ge=1, le=1_000_000_000, description="Input tokens per request")
@@ -337,6 +347,21 @@ class PerfGuidellmSweepParams(BaseModel):
             "minimum 1."
         ),
     )
+    bisect_by_total_tps: bool = Field(
+        json_schema_extra=_AUTO_ONLY,
+        default=True,
+        description=(
+            "[auto] Make total throughput part of the pass/fail verdict the "
+            "ramp and binary search steer by: a probe passes only when it "
+            "meets the SLOs AND its total TPS is higher than that of every "
+            "lower level that passed. Past the throughput peak, more "
+            "concurrency only queues requests, so a level can meet loose SLOs "
+            "while delivering fewer tokens; with this on, the search treats "
+            "it as failing and settles on the highest-throughput level inside "
+            "the SLOs. Off = SLOs alone decide (the highest concurrency that "
+            "meets them, whatever its throughput)."
+        ),
+    )
     max_total_seconds: float = Field(
         json_schema_extra=_AUTO_ONLY,
         default=7200.0, ge=1.0, le=86400.0,
@@ -423,9 +448,22 @@ class PerfGuidellmSweepParams(BaseModel):
         ),
     )
 
+    @field_validator("concurrencies", mode="before")
+    @classmethod
+    def _concurrencies_as_text(cls, v):
+        # YAML reads `concurrencies: 0` or `concurrencies: 4` as a number, not
+        # the string this field holds; take the number as its text.
+        if isinstance(v, int) and not isinstance(v, bool):
+            return str(v)
+        return v
+
     @field_validator("concurrencies")
     @classmethod
-    def _normalize_concurrencies(cls, v: str) -> str:
+    def _normalize_concurrencies(cls, v: Optional[str]) -> Optional[str]:
+        # Empty (or a bare 0) = no grid: what an auto-mode config holds, since
+        # auto picks its own levels. Grid mode refuses it below.
+        if v is None or v.strip() in ("", "0"):
+            return None
         return ",".join(str(n) for n in parse_concurrencies(v))
 
     @model_validator(mode="after")
@@ -456,6 +494,10 @@ class PerfGuidellmSweepParams(BaseModel):
 
     @model_validator(mode="after")
     def _check_fixed_level(self):
+        if self.search_mode == "grid" and self.concurrencies is None:
+            raise ValueError(
+                "grid mode needs concurrencies, e.g. '1,2,4,8,16' — only auto "
+                "mode may leave it empty")
         if self.search_mode == "grid" and self.report_level == "fixed":
             if self.fixed_level is None:
                 raise ValueError("report_level='fixed' requires fixed_level to be set")
@@ -475,7 +517,7 @@ class PerfGuidellmSweepParams(BaseModel):
         return self.slo_max_ttft_ms
 
     def concurrency_levels(self) -> List[int]:
-        return parse_concurrencies(self.concurrencies)
+        return parse_concurrencies(self.concurrencies) if self.concurrencies else []
 
 
 class PerfGuidellmSweepModule(_GuidellmBudgetMixin, TestModule):
@@ -485,7 +527,7 @@ class PerfGuidellmSweepModule(_GuidellmBudgetMixin, TestModule):
     def _budget_rates(cls, params) -> list:
         # Every level runs sequentially, so the budget scales with how many there
         # are — reading params.max_seconds alone would under-estimate by len(levels).
-        return [float(n) for n in parse_concurrencies(params.concurrencies)]
+        return [float(n) for n in params.concurrency_levels()]
 
     @classmethod
     def time_budget_seconds(cls, params) -> "float | None":
@@ -546,6 +588,7 @@ class PerfGuidellmSweepModule(_GuidellmBudgetMixin, TestModule):
         MetricDescriptor("search_probes",        "Search Probes",    "",      "[auto] Number of guidellm runs the search executed (probes, retries, confirmations)"),
         MetricDescriptor("search_converged",     "Search Converged", "",      "[auto] 1 if the search closed its pass/fail bracket to the configured granularity (or passed at the concurrency cap); 0 if it stopped early on the max_total_seconds budget", higher_is_better=True),
         MetricDescriptor("slo_fail_concurrency", "First Failing Level", "",   "[auto] Lowest concurrency the search treated as failing — it either missed the SLOs (in a probe or in the longer confirmation run) or produced no usable result. Absent when every level passed"),
+        MetricDescriptor("search_tps_peak_concurrency", "Throughput Stalled At", "", "[auto, bisect_by_total_tps] Lowest level that met the SLOs in its probe but did not raise total TPS above a lower passing level, so the search treated it as past the throughput peak. Absent when throughput kept rising"),
         MetricDescriptor("search_research_rounds", "Re-searches", "",          "[auto] Times a full-length confirmation contradicted the shorter probe that passed its level, forcing the bracket to reopen. Above zero means probes are too short to be trustworthy — raise probe_seconds or the per-slot probe request count"),
         MetricDescriptor("drain_wait_seconds",   "Drain Wait",       "s",     "[auto, per level] How long the search waited before this level for the endpoint to finish the previous level's leftovers (settle pause plus canary checks)"),
         MetricDescriptor("pre_level_canary_ms",  "Pre-level Canary", "ms",    "[auto, per level] Latency of the last tiny canary request before this level started. Near the idle reference means the endpoint was quiet; far above it means the level ran on a still-busy endpoint"),
@@ -606,12 +649,14 @@ class PerfGuidellmSweepModule(_GuidellmBudgetMixin, TestModule):
             logger.info(
                 "[%s] auto search starting | SLO: request_output_tps>=%g, %s<=%.0fms "
                 "| probes: %s requests/slot capped at %.0fs | confirmation: %s "
-                "requests/slot capped at %.0fs | max concurrency %d | budget %.0fs",
+                "requests/slot capped at %.0fs | max concurrency %d | budget %.0fs "
+                "| a level must also raise total TPS: %s",
                 self.name, p.slo_min_request_output_tps, _slo_ttft_key(p),
                 p.effective_max_ttft_ms(),
                 p.probe_requests_per_concurrency or "unlimited", p.probe_seconds,
                 p.requests_per_concurrency or "unlimited", p.max_seconds,
                 p.search_max_concurrency, p.max_total_seconds,
+                "yes" if p.bisect_by_total_tps else "no",
             )
             return self._run_auto(endpoint, p, output_dir, progress_cb, cancel_event)
 
@@ -803,6 +848,37 @@ class PerfGuidellmSweepModule(_GuidellmBudgetMixin, TestModule):
         def slo_ok(out: _ProbeOutcome) -> bool:
             return out.level_metrics is not None and _meets_slo(out.level_metrics, p)
 
+        # Levels that met the SLOs but delivered no more total throughput than
+        # a lower passing level: past the throughput peak (bisect_by_total_tps).
+        stalled: List[int] = []
+
+        def advances(level: int, out: _ProbeOutcome) -> bool:
+            """The verdict the ramp and the bisection steer by. SLOs alone
+            unless bisect_by_total_tps: then the level must also beat the total
+            TPS of every lower level that passed, or it is past the
+            throughput peak and counts as failing."""
+            if not slo_ok(out):
+                return False
+            if not p.bisect_by_total_tps:
+                return True
+            below = [(lvl, _level_total_tps(o.level_metrics))
+                     for lvl, o in runs.items() if lvl < level and slo_ok(o)]
+            if not below:
+                return True
+            best_level, best_tps = max(below, key=lambda lv: lv[1])
+            tps = _level_total_tps(out.level_metrics)
+            if tps > best_tps:
+                return True
+            stalled.append(level)
+            logger.info(
+                "[%s] c=%d meets the SLOs but total TPS %.1f <= %.1f at c=%d — "
+                "past the throughput peak, treated as failing",
+                self.name, level, tps, best_tps, best_level)
+            band_progress(
+                f"auto search: c={level} → past the throughput peak "
+                f"(total TPS {tps:.0f} ≤ {best_tps:.0f} at c={best_level})")
+            return False
+
         def budget_allows_probe() -> bool:
             # Reserve room for the confirmation run — it is the deliverable.
             return ((time.monotonic() - t0) + next_probe_cost() + confirm_cost
@@ -833,7 +909,7 @@ class PerfGuidellmSweepModule(_GuidellmBudgetMixin, TestModule):
                         "(max_total_seconds=%.0fs) cannot fit another probe plus "
                         "the confirmation run", self.name, c, p.max_total_seconds)
                     break
-                if slo_ok(run_level(c, p.probe_seconds, "probe")):
+                if advances(c, run_level(c, p.probe_seconds, "probe")):
                     lo = c
                     c *= 2
                 else:
@@ -877,7 +953,7 @@ class PerfGuidellmSweepModule(_GuidellmBudgetMixin, TestModule):
                     break
                 logger.info("[%s] bracket (%d, %d) -> probing midpoint c=%d",
                             self.name, lo_pass, hi_fail, mid)
-                if slo_ok(run_level(mid, p.probe_seconds, "probe")):
+                if advances(mid, run_level(mid, p.probe_seconds, "probe")):
                     lo_pass = mid
                 else:
                     hi_fail = mid
@@ -968,6 +1044,8 @@ class PerfGuidellmSweepModule(_GuidellmBudgetMixin, TestModule):
         failing = [lvl for lvl, o in runs.items() if not slo_ok(o)]
         if failing:
             metrics["slo_fail_concurrency"] = float(min(failing))
+        if stalled:
+            metrics["search_tps_peak_concurrency"] = float(min(stalled))
         for code, n in http_totals.items():
             metrics[f"http_status_{code}"] = float(n)
 
