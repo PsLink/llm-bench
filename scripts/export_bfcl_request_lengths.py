@@ -8,6 +8,8 @@ Usage:
 
 Buckets are [lower, upper). Percentages use the valid successful samples of
 each metric, not all requests. Missing usage stays blank, rather than zero.
+When a metric has no valid samples, bucket token totals stay blank and the
+console total is N/A. Measured zero usage retains numeric zero totals.
 Input tokens already include cached input tokens. Each CSV row represents an
 HTTP attempt; request_index includes tool continuations, not just user turns.
 """
@@ -91,12 +93,13 @@ def main():
             counts[index] += 1
             totals[index] += value
         missing = len(successful) - len(values)
-        print(f"\n{metric}：有效 {len(values)}，缺报 {missing}，总 token {sum(values):,}")
+        total_text = f"{sum(values):,}" if values else "N/A"
+        print(f"\n{metric}：有效 {len(values)}，缺报 {missing}，总 token {total_text}")
         for label, count, total in zip(labels, counts, totals):
             percent = count / len(values) * 100 if values else None
             bucket_rows.append({
                 "metric": metric, "bucket": label, "request_count": count,
-                "request_percent": percent, "token_total": total,
+                "request_percent": percent, "token_total": total if values else None,
                 "valid_samples": len(values), "missing_samples": missing,
             })
             percent_text = f"{percent:.2f}%" if percent is not None else "N/A"
