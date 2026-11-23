@@ -71,8 +71,11 @@ bound. Cancellation and budget expiry retain scan artifacts and completed points
 The worker supplies frozen benchmark metric configs for per-point eligibility.
 Raw `c<N>` groups retain every point; top-level scalars select the highest total
 TPM meeting those rules (lower concurrency wins a tie). With no eligible point,
-scalars are diagnostic and the benchmark fails its rules. Any execution-invalid
-or missing-metric point makes the scan incomplete and unrankable.
+scalars are diagnostic and the benchmark fails its rules. Failed or missing-metric points make the scan incomplete, but do not prevent
+ranking when another valid point meets all rules. Per-point timeouts and total
+budget expiry follow the same policy. User cancellation always prevents ranking,
+even when earlier points qualified. Scan counts and point failure reasons remain
+available for reports.
 
 Submission overrides use `extra_params.bfcl_concurrency_grid` on standalone BFCL
 benchmarks; optional `expected_benchmark_config_hash` rejects queued protocol

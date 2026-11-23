@@ -136,6 +136,9 @@ class BFCLV4Module(TestModule):
             ("accuracy", "", True),
             ("reported_concurrency", "cases", True),
             ("sweep_complete", "", True),
+            ("sweep_canceled", "", False),
+            ("sweep_timed_out", "", False),
+            ("sweep_points_attempted", "", True),
             ("sweep_points_completed", "", True),
             ("sweep_points_planned", "", True),
             ("accuracy_simple_python", "", True),
@@ -217,19 +220,24 @@ class BFCLV4Module(TestModule):
         configs = endpoint.run_context.get("metric_configs") or []
         levels = {}
         canceled = None
+        stop_reason = ""
+        timed_out = False
+        active_concurrency = None
         try:
             for i, concurrency in enumerate(grid):
                 if cancel_event is not None and cancel_event.is_set():
                     raise BenchmarkCancelled("BFCL scan canceled")
                 remaining = deadline - time.monotonic()
                 if remaining < 1:
-                    result.error = "BFCL scan exceeded its total wall-clock budget"
+                    timed_out = True
+                    stop_reason = "BFCL scan exceeded its total wall-clock budget"
                     break
                 point = params.model_copy(update={
                     "concurrency_grid": None, "max_total_seconds": None,
                     "concurrency": concurrency, "max_seconds": min(params.max_seconds, remaining),
                     "probe_endpoint": params.probe_endpoint and i == 0,
                 })
+                active_concurrency = concurrency
                 child = self._run_single(
                     endpoint, point, str(root / f"c{concurrency}"),
                     lambda fraction, message, i=i, c=concurrency: progress_cb(
@@ -237,7 +245,7 @@ class BFCLV4Module(TestModule):
                     cancel_event,
                 )
                 required = ["total_tpm", *[c["key"] for c in configs
-                                             if c.get("role") in ("score", "redline")]]
+                                         if c.get("role") in ("score", "redline")]]
                 valid = not child.error and all(
                     isinstance(child.metrics.get(k), (int, float))
                     and math.isfinite(child.metrics[k]) for k in required)
@@ -247,33 +255,54 @@ class BFCLV4Module(TestModule):
                     "case_concurrency": concurrency,
                 }
                 if not valid:
-                    _write_json(root / f"c{concurrency}" / "failure.json", {
-                        "error": child.error or "Missing required point metrics"})
+                    error = child.error or "Missing required point metrics"
+                    levels[f"c{concurrency}"]["error"] = error
+                    _write_json(root / f"c{concurrency}" / "failure.json", {"error": error})
                 result.metrics.update(levels)
-            complete = len(levels) == len(grid) and all(v["valid"] for v in levels.values())
+                active_concurrency = None
+            if cancel_event is not None and cancel_event.is_set():
+                raise BenchmarkCancelled("BFCL scan canceled")
+        except BenchmarkCancelled as exc:
+            timeout_event = getattr(cancel_event, "bfcl_timeout_event", None)
+            if timeout_event is not None and timeout_event.is_set():
+                timed_out = True
+                stop_reason = "BFCL scan exceeded the worker time budget"
+            else:
+                canceled = exc
+                stop_reason = result.error = "BFCL scan canceled"
+            if active_concurrency is not None:
+                levels[f"c{active_concurrency}"] = {
+                    "valid": 0, "eligible": 0, "case_concurrency": active_concurrency,
+                    "error": stop_reason,
+                }
+                result.metrics.update(levels)
+        finally:
+            # Keep a representative even on cancellation for diagnostics; the
+            # cancellation flag always prevents it from ranking or becoming a best level.
             passing = [(k, v) for k, v in levels.items() if v["eligible"]]
             diagnostic = [(k, v) for k, v in levels.items() if v["valid"]]
             choices = passing or diagnostic
             if choices:
                 key, best = max(choices, key=lambda kv: (
-                    kv[1].get("total_tpm", float("-inf")), -kv[1]["case_concurrency"]))
+                    kv[1]["total_tpm"], -kv[1]["case_concurrency"]))
                 result.metrics.update({k: v for k, v in best.items()
-                                       if k not in ("valid", "eligible")})
+                                       if k not in ("valid", "eligible", "error")})
                 result.metrics["reported_concurrency"] = int(key[1:])
-            result.metrics.update(sweep_complete=int(complete),
-                                  sweep_points_completed=len(levels), sweep_points_planned=len(grid))
+            elif canceled is None:
+                result.error = stop_reason or "BFCL scan produced no valid concurrency point"
+            complete = len(levels) == len(grid) and all(v["valid"] for v in levels.values())
+            result.metrics.update(
+                sweep_complete=int(complete and canceled is None),
+                sweep_canceled=int(canceled is not None), sweep_timed_out=int(timed_out),
+                sweep_stop_reason=stop_reason, sweep_points_attempted=len(levels),
+                sweep_points_completed=sum(v["valid"] for v in levels.values()),
+                sweep_points_planned=len(grid),
+            )
             result.extra_display_configs = [
                 {"key": f"{level}.{metric}", "role": "display"}
-                for level, values in levels.items() for metric in values
+                for level, values in levels.items() for metric, value in values.items()
+                if isinstance(value, (int, float))
             ]
-            if not complete:
-                result.error = result.error or "BFCL scan incomplete; inspect per-level artifacts"
-        except BenchmarkCancelled as exc:
-            canceled = exc
-            result.error = "BFCL scan canceled"
-            result.metrics.update(sweep_complete=0, sweep_points_completed=len(levels),
-                                  sweep_points_planned=len(grid))
-        finally:
             protocol = {"params": params.model_dump(exclude_none=True), "redlines": configs}
             _write_json(root / "scan.json", {
                 "protocol_hash": hashlib.sha256(json.dumps(

@@ -3,6 +3,8 @@
 import json
 import sys
 import threading
+
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -11,16 +13,19 @@ from app.api.submissions import _normalize_extra_params
 from app.db.models import ModuleRunStatus, SubmissionStatus
 from app.queue import jobs
 from app.schemas.benchmarks import SubmissionExtraParams
-from bench.modules.base import EndpointConfig
+from bench.modules.base import BenchmarkCancelled, BenchmarkTimeout, EndpointConfig
 
 
-def test_worker_executes_and_freezes_the_submission_grid_without_point_fanout(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failure", [None, "timeout", "cancel", "late_cancel", "quality", "all"])
+def test_worker_executes_and_freezes_the_submission_grid_without_point_fanout(
+    tmp_path, monkeypatch, failure,
+):
     monkeypatch.setenv("BFCL_PYTHON", sys.executable)
     grid = [1, 3, 5, 6, 8]
     extra = _normalize_extra_params(SubmissionExtraParams(bfcl_concurrency_grid=grid))
     submission = SimpleNamespace(id=41, benchmark_id=1, extra_params=extra,
                                  status=SubmissionStatus.RUNNING, cards_per_machine=2,
-                                 machine_count=1, card_type="A100")
+                                 machine_count=1, card_type="A100", passed=None)
     run = SimpleNamespace(id=42, module_name="bfcl_v4", params_json={
         "concurrency": 2, "request_timeout_seconds": 45},
         metric_configs_json=[{"key": "accuracy", "role": "redline", "min_val": 0.8}],
@@ -43,20 +48,44 @@ def test_worker_executes_and_freezes_the_submission_grid_without_point_fanout(tm
         if command[-3] == "evaluate":
             c = params["concurrency"]
             seen.append(c)
+            if failure == "all":
+                raise RuntimeError("point failed")
+            if c == 8 and failure == "timeout":
+                raise BenchmarkTimeout("point timed out")
+            if c == 8 and failure == "cancel":
+                submission.status = SubmissionStatus.CANCELED
+                raise BenchmarkCancelled("user canceled")
             (root / "summary.json").write_text(json.dumps({"metrics": {
-                "total_tpm": 1000 * c, "accuracy": 0.5 if c == 8 else 0.9}}))
+                "total_tpm": 1000 * c, "accuracy": 0.5 if c == 8 or failure == "quality" else 0.9}}))
     monkeypatch.setattr("bench.modules.bfcl_v4.run_process", runner)
+    if failure == "late_cancel":
+        refreshes = []
+        def refresh(row):
+            refreshes.append(row)
+            if len(refreshes) == 2:
+                submission.status = SubmissionStatus.CANCELED
+        session.refresh.side_effect = refresh
     results = []
     jobs._run_module_loop(session, submission, [mod], EndpointConfig("http://localhost/v1", "m"),
                           results, str(tmp_path), threading.Event())
-    assert len(results) == 1
     assert seen == grid
     assert run.params_json["concurrency_grid"] == grid
-    assert run.metrics_json["reported_concurrency"] == 6
-    assert run.metrics_json["sweep_complete"] == 1
-    assert run.passed and run.status == ModuleRunStatus.DONE
-    assert submission.passed
     session.add.assert_not_called()
+    if failure in ("cancel", "late_cancel"):
+        assert run.metrics_json["sweep_canceled"] == 1
+        assert run.status == ModuleRunStatus.FAILED and not run.passed
+        assert not submission.passed
+        assert submission.status == SubmissionStatus.CANCELED
+        return
+    assert len(results) == 1
+    assert run.metrics_json["sweep_canceled"] == 0
+    assert run.metrics_json["sweep_complete"] == int(failure not in ("timeout", "all"))
+    if failure in ("quality", "all"):
+        assert not run.passed and not submission.passed
+    else:
+        assert run.metrics_json["reported_concurrency"] == 6
+        assert run.passed and run.status == ModuleRunStatus.DONE
+        assert submission.passed
 
 
 def test_changed_benchmark_is_rejected_before_running_queued_points(tmp_path):

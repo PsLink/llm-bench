@@ -1331,6 +1331,8 @@ def _run_module_loop(
             abort_event, timed_out, stop_deadline = _start_module_deadline(
                 submission.id, module_name, cancel_event, time_cap
             )
+            if module_name == "bfcl_v4":
+                abort_event.bfcl_timeout_event = timed_out
             progress_cb = _make_progress_cb(submission.id, run.id, module_name, abort_event)
             # Close out any transaction the setup above opened (params, the
             # concurrency override, the run row) BEFORE handing control to a module
@@ -1359,6 +1361,14 @@ def _run_module_loop(
                     progress_cb=progress_cb,
                 )
 
+            if module_name == "bfcl_v4" and getattr(params, "concurrency_grid", None):
+                session.refresh(submission)
+                if submission.status == SubmissionStatus.CANCELED:
+                    result.metrics["sweep_canceled"] = 1
+                    result.error = "BFCL scan canceled"
+                    exc = BenchmarkCancelled(result.error)
+                    exc.artifacts, exc.partial_result = result.artifacts, result
+                    raise exc
             _add_card_normalized_tpm(result, submission, module_cls, module_name)
             _add_dataset_identity(result, run, module_cls, module_name)
 
