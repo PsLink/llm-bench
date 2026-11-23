@@ -1208,15 +1208,17 @@ def _run_module_loop(
 ) -> None:
     """Inner module loop. Kept separate so _run_modules can wrap it in try/finally
     for watcher cleanup without re-indenting the whole body on every refactor."""
-    from app.db.models import SubmissionRun, ModuleRunStatus, SubmissionStatus
+    from app.db.models import Benchmark, SubmissionRun, ModuleRunStatus, SubmissionStatus
 
     from app.queue.log_capture import checkpoint_worker_log
 
     scan_requested = (submission.extra_params or {}).get("bfcl_concurrency_grid") or any(
         (getattr(mod, "params_json", None) or {}).get("concurrency_grid") for mod in modules)
-    benchmark = getattr(submission, "benchmark", None)
-    if scan_requested and benchmark is not None:
-        if benchmark.config_hash != submission.benchmark_config_hash:
+    if scan_requested and submission.benchmark_id is not None:
+        # Submission.benchmark uses lazy='raise' and is not loaded by the worker.
+        # Query explicitly, and only for scans that need the frozen config check.
+        benchmark = session.get(Benchmark, submission.benchmark_id)
+        if benchmark is None or benchmark.config_hash != submission.benchmark_config_hash:
             _fail_submission(session, submission, "BFCL benchmark changed before scan execution")
             return
 
