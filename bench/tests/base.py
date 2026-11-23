@@ -6,6 +6,7 @@ infrastructure so GuideLLM-backed tests share one implementation path.
 """
 from __future__ import annotations
 
+import math
 import os
 from abc import ABC, abstractmethod
 from typing import Any, Dict
@@ -148,6 +149,7 @@ class GuideLLMBaseTest(BaseTest):
             logger.info("[%s] guidellm benchmarks.json: %s", self.name, os.path.abspath(outputs["json"]))
             with open(outputs["json"], "r", encoding="utf-8") as f:
                 guidellm_results = json.load(f)
+            rebuild_empty_windows(guidellm_results, self.name)
             metrics = self._extract_metrics(guidellm_results)
             failure = _all_requests_failed(guidellm_results)
             if failure is not None:
@@ -194,3 +196,155 @@ def _all_requests_failed(results: dict) -> str | None:
         f"every request failed — 0 succeeded, so all metrics are 0 and the score "
         f"is meaningless. Error(s): {shown}{more}"
     )
+
+
+# Latency families rebuilt per request from guidellm's per-request records.
+# Key = guidellm's metric name, which is also the per-request field name.
+_REBUILT_LATENCIES = (
+    "time_to_first_token_ms",
+    "time_per_output_token_ms",
+    "inter_token_latency_ms",
+    "request_latency",
+)
+# Rate families rebuilt as one aggregate over the requests' span:
+# guidellm metric name -> per-request token field summed into the numerator
+# (None = count requests).
+_REBUILT_RATES = {
+    "prompt_tokens_per_second": "prompt_tokens",
+    "output_tokens_per_second": "output_tokens",
+    "tokens_per_second": "total_tokens",
+    "requests_per_second": None,
+}
+_REBUILT_PERCENTILES = {
+    "p001": 0.1, "p01": 1.0, "p05": 5.0, "p10": 10.0, "p25": 25.0,
+    "p50": 50.0, "p75": 75.0, "p90": 90.0, "p95": 95.0, "p99": 99.0,
+    "p999": 99.9,
+}
+_REQUEST_STATUSES = ("successful", "errored", "incomplete")
+
+
+def _nearest_rank(sorted_values: list[float], pct: float) -> float:
+    """Nearest-rank percentile: the smallest value with at least pct% of the
+    sample at or below it. Never interpolates, so every reported percentile
+    is a latency some request actually had."""
+    rank = max(1, math.ceil(pct / 100.0 * len(sorted_values)))
+    return sorted_values[rank - 1]
+
+
+def _distribution(values: list[float]) -> dict:
+    ordered = sorted(values)
+    return {
+        "mean": sum(ordered) / len(ordered),
+        "median": _nearest_rank(ordered, 50.0),
+        "min": ordered[0],
+        "max": ordered[-1],
+        "count": len(ordered),
+        "percentiles": {k: _nearest_rank(ordered, p)
+                        for k, p in _REBUILT_PERCENTILES.items()},
+    }
+
+
+def _flat_rate(value: float, count: int) -> dict:
+    """A rate measured once over the whole span: every statistic is that one
+    value (there is no per-interval distribution to report)."""
+    return {"mean": value, "median": value, "min": value, "max": value,
+            "count": count,
+            "percentiles": {k: value for k in _REBUILT_PERCENTILES}}
+
+
+def rebuild_empty_windows(results: dict, log_tag: str = "guidellm") -> list[int]:
+    """Give a level whose measured window came out empty the numbers its
+    finished requests did measure, instead of guidellm's zero placeholders.
+
+    guidellm drops warmup and cooldown requests before computing statistics.
+    Against a slow endpoint, a level stopped by its duration cap can finish
+    only a few requests, all inside the warmup share: the measured window is
+    then empty, every statistic is a 0 placeholder and the duration goes
+    negative — which reads as a level that was measured and scored 0.
+
+    For each such level (no successful request in the measured window, with
+    at least one successful request finished overall — a window holding only
+    the request the cap cut off counts as empty too), this rewrites the level's metrics in place from ALL
+    the requests it finished, warmup and cooldown included:
+      - latencies (TTFT, TPOT, ITL, request latency): per-request
+        distributions with nearest-rank percentiles;
+      - token and request rates: one aggregate over the span from the first
+        request's start to the last one's end;
+      - request_totals and duration: recomputed from those requests;
+    and stamps ``warmup_included`` (requests used) on the benchmark so the
+    result says the sample is thin and includes warmup/cooldown.
+
+    guidellm stores at most ``sample_size`` requests per status, chosen at
+    random. A level is rebuilt only when the stored requests are ALL of them
+    (the successful and errored lists match scheduler_metrics.requests_made);
+    otherwise the figures would come from an arbitrary subset, and the level
+    is left empty. Incomplete requests are not compared: requests_made counts
+    ones cancelled before they started, which guidellm never stores.
+
+    Levels that measured anything are untouched. A level where nothing
+    succeeded is left for _all_requests_failed / the empty-window handling.
+    Returns the indexes of the rebuilt benchmarks.
+    """
+    rebuilt: list[int] = []
+    for index, bench in enumerate(results.get("benchmarks") or []):
+        metrics = bench.get("metrics") or {}
+        totals = metrics.get("request_totals") or {}
+        # Every statistic is computed over successful requests only, so a
+        # window holding just an incomplete (or errored) request is as empty
+        # as one holding nothing.
+        if totals.get("successful"):
+            continue
+        stored = {s: list((bench.get("requests") or {}).get(s) or [])
+                  for s in _REQUEST_STATUSES}
+        successful = stored["successful"]
+        if not successful:
+            continue
+        level = ((bench.get("config") or {}).get("strategy") or {}).get("max_concurrency")
+        made = (bench.get("scheduler_metrics") or {}).get("requests_made") or {}
+        # successful/errored only: requests_made.incomplete also counts
+        # requests cancelled before they started, which guidellm never stores.
+        if any(len(stored[s]) != int(made.get(s) or 0) for s in ("successful", "errored")):
+            logger.warning(
+                "[%s] c=%s measured nothing (every finished request fell in "
+                "warmup/cooldown) and cannot be rebuilt: guidellm stored %s of "
+                "%s requests, so the stored ones are a sample, not all of them",
+                log_tag, level,
+                {s: len(v) for s, v in stored.items()},
+                {s: made.get(s) for s in _REQUEST_STATUSES},
+            )
+            continue
+        starts = [r.get("request_start_time") for r in successful]
+        ends = [r.get("request_end_time") for r in successful]
+        if any(t is None for t in starts + ends):
+            logger.warning("[%s] c=%s measured nothing and cannot be rebuilt: "
+                           "a finished request has no start/end time", log_tag, level)
+            continue
+        span = max(ends) - min(starts)
+        if span <= 0:
+            continue
+
+        for name in _REBUILT_LATENCIES:
+            values = [float(r[name]) for r in successful if r.get(name) is not None]
+            if values:
+                metrics[name] = {**(metrics.get(name) or {}),
+                                 "successful": _distribution(values)}
+        for name, field in _REBUILT_RATES.items():
+            amount = (len(successful) if field is None
+                      else sum(float(r.get(field) or 0) for r in successful))
+            metrics[name] = {**(metrics.get(name) or {}),
+                             "successful": _flat_rate(amount / span, len(successful))}
+        counts = {s: len(stored[s]) for s in _REQUEST_STATUSES}
+        metrics["request_totals"] = {**counts, "total": sum(counts.values())}
+        bench["metrics"] = metrics
+        bench["duration"] = span
+        bench["warmup_included"] = len(successful)
+        rebuilt.append(index)
+        logger.warning(
+            "[%s] c=%s: every finished request fell in warmup/cooldown, so the "
+            "measured window was empty. Reporting the %d request(s) that "
+            "finished instead (warmup/cooldown included, %.0fs span) — a thin "
+            "sample: raise the duration cap or lower the per-slot request count "
+            "for a real measurement.",
+            log_tag, level, len(successful), span,
+        )
+    return rebuilt

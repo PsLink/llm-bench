@@ -122,6 +122,7 @@ from bench.modules.base import (
     MetricDescriptor, ModuleResult, ProgressCallback, TestModule, _noop_progress,
 )
 from bench.modules.perf_guidellm import (
+    _EMPTY_WINDOW_ERROR,
     PerfGuidellmModule,
     _GuidellmBudgetMixin,
     run_guidellm_load,
@@ -580,6 +581,10 @@ class PerfGuidellmSweepModule(_GuidellmBudgetMixin, TestModule):
     metrics_descriptors = [
         *PerfGuidellmModule.metrics_descriptors,
         MetricDescriptor("reported_level_meets_slo", "Meets SLO",    "",      "1 if the reported level meets the configured per-request-TPS/TTFT SLOs, else 0", higher_is_better=True),
+        MetricDescriptor("reported_level_truncated", "Reported Level Truncated", "", "1 if the reported level was stopped by its duration cap before finishing its requests — a smaller, noisier sample than configured"),
+        MetricDescriptor("reported_level_warmup_included", "Warmup Requests Used", "", "Number of requests the reported level's figures come from when its measurement window was empty and they had to be taken from warmup/cooldown instead (0 = a normal measurement). Nonzero means a thin sample against a slow endpoint"),
+        MetricDescriptor("truncated",            "Truncated",        "",      "[per level] 1 if this level was stopped by its duration cap before finishing its requests"),
+        MetricDescriptor("inconclusive",         "Inconclusive",     "",      "[auto, per level] 1 if the search did not trust this level's numbers (empty, rebuilt from a first wave at c>1, or fewer measured requests than one wave) and treated it as not passing"),
         MetricDescriptor("duration_cap_seconds", "Level Duration Cap", "s",   "Duration limit this level ran under: probe_seconds for a search probe, max_seconds for a confirmation run"),
         MetricDescriptor("peak_concurrency",     "Peak Level",       "",      "Concurrency level with the highest total TPS (ignoring SLOs)"),
         MetricDescriptor("peak_input_tps",       "Peak Input TPS",   "tok/s", "Input TPS at the peak-throughput level",  higher_is_better=True),
@@ -617,6 +622,8 @@ class PerfGuidellmSweepModule(_GuidellmBudgetMixin, TestModule):
         MetricConfig("request_output_tps",   role="display"),
         MetricConfig("reported_concurrency", role="display"),
         MetricConfig("reported_level_meets_slo", role="display"),
+        MetricConfig("reported_level_truncated", role="display"),
+        MetricConfig("reported_level_warmup_included", role="display"),
         MetricConfig("peak_concurrency",     role="display"),
         MetricConfig("peak_input_tps",       role="display"),
         MetricConfig("peak_output_tps",      role="display"),
@@ -688,11 +695,23 @@ class PerfGuidellmSweepModule(_GuidellmBudgetMixin, TestModule):
 
         _nest_level_metrics(metrics)
         _add_request_output_tps(metrics)
+        for level, level_metrics in _iter_levels(metrics):
+            run_seconds = level_metrics.get("run_seconds")
+            level_metrics["truncated"] = 1.0 if run_seconds is not None and _warn_if_truncated(
+                self.name, "grid", level, p.max_seconds, p.requests_per_concurrency,
+                level_metrics, wall_seconds=float(run_seconds),
+                measured_fraction=1.0 - p.warmup_fraction - p.cooldown_fraction,
+            ) else 0.0
         _add_level_slo_flags(metrics, p)
         _add_peak_metrics(metrics)
         reported = _select_reported_level(metrics, p)
-        if reported is not None:
-            _promote_canonical(metrics, reported, p)
+        if reported is None:
+            return ModuleResult(
+                metrics=metrics,
+                extra_display_configs=_per_level_display_configs(metrics),
+                error=_EMPTY_WINDOW_ERROR.format(level=f"every level ({levels})"),
+            )
+        _promote_canonical(metrics, reported, p)
 
         progress_cb(0.99, "Metrics collected — evaluator will compute score")
         logger.info(
@@ -818,15 +837,28 @@ class PerfGuidellmSweepModule(_GuidellmBudgetMixin, TestModule):
                                self.name, tag, level, attempt, out.error)
             # Never let a metric-less outcome clobber good data for the level
             # (e.g. a crashed confirmation run after a clean probe).
-            if level not in runs or out.level_metrics is not None:
+            # An empty measurement window is no better than no result.
+            if (level not in runs
+                    or (out.level_metrics is not None
+                        and not (_level_is_empty(out.level_metrics)
+                                 and _level_has_data(runs[level])))):
                 runs[level] = out
             wall = time.monotonic() - run_started
             if out.level_metrics is not None:
-                _warn_if_truncated(self.name, tag, level, duration,
-                                   requests_cap, out.level_metrics,
-                                   wall_seconds=wall,
-                                   measured_fraction=1.0 - warmup_frac - cooldown_frac)
-                verdict = "pass" if _meets_slo(out.level_metrics, p) else "FAIL"
+                truncated = _warn_if_truncated(
+                    self.name, tag, level, duration, requests_cap,
+                    out.level_metrics, wall_seconds=wall,
+                    measured_fraction=1.0 - warmup_frac - cooldown_frac)
+                out.level_metrics["truncated"] = 1.0 if truncated else 0.0
+                why = _level_inconclusive(level, out.level_metrics)
+                out.level_metrics["inconclusive"] = 1.0 if why else 0.0
+                if why:
+                    logger.warning(
+                        "[%s] %s c=%d is inconclusive — %s — and counts as not "
+                        "passing: the search will not climb on it",
+                        self.name, tag, level, why)
+                verdict = ("INCONCLUSIVE" if why
+                           else "pass" if _meets_slo(out.level_metrics, p) else "FAIL")
                 # The log is the only record of how a search reached its answer
                 # once the run is over, so each level states its verdict, the
                 # numbers behind it, and how much data it rests on.
@@ -846,7 +878,12 @@ class PerfGuidellmSweepModule(_GuidellmBudgetMixin, TestModule):
             return out
 
         def slo_ok(out: _ProbeOutcome) -> bool:
-            return out.level_metrics is not None and _meets_slo(out.level_metrics, p)
+            # An inconclusive level (empty, rebuilt from a first wave, or
+            # under one wave of requests) never counts as passing: its
+            # numbers are too thin, or too optimistic, to steer by.
+            return (out.level_metrics is not None
+                    and not out.level_metrics.get("inconclusive")
+                    and _meets_slo(out.level_metrics, p))
 
         # Levels that met the SLOs but delivered no more total throughput than
         # a lower passing level: past the throughput peak (bisect_by_total_tps).
@@ -1028,8 +1065,15 @@ class PerfGuidellmSweepModule(_GuidellmBudgetMixin, TestModule):
                 metrics[f"c{level}"] = level_metrics
         _add_level_slo_flags(metrics, p)
         _add_peak_metrics(metrics)
-        if f"c{chosen}" in metrics:
+        if f"c{chosen}" in metrics and not _level_is_empty(metrics[f"c{chosen}"]):
             _promote_canonical(metrics, chosen, p)
+        elif f"c{chosen}" in metrics:
+            return ModuleResult(
+                metrics=metrics,
+                extra_display_configs=_per_level_display_configs(metrics),
+                error="auto search: " + _EMPTY_WINDOW_ERROR.format(
+                    level=f"the reported level c={chosen}"),
+            )
         else:
             logger.warning("[%s] chosen level c=%d has no usable metrics — "
                            "skipping canonical promotion", self.name, chosen)
@@ -1184,7 +1228,8 @@ def _add_level_slo_flags(metrics: dict, p: "PerfGuidellmSweepParams") -> None:
 def _select_reported_level(metrics: dict, p: "PerfGuidellmSweepParams") -> Optional[int]:
     """Pick the level whose metrics become the canonical top-level keys,
     per the report_level param. Returns None when no level produced metrics."""
-    levels = dict(_iter_levels(metrics))
+    # A level that measured nothing has no values to rank or report.
+    levels = {lvl: lm for lvl, lm in _iter_levels(metrics) if not _level_is_empty(lm)}
     if not levels:
         return None
 
@@ -1222,6 +1267,7 @@ def _select_reported_level(metrics: dict, p: "PerfGuidellmSweepParams") -> Optio
 _UNPROMOTED_LEVEL_KEYS = {
     "meets_slo", "duration_seconds", "duration_cap_seconds", "measured_requests",
     "drain_wait_seconds", "pre_level_canary_ms", "started_drained",
+    "run_seconds", "empty_window", "truncated", "inconclusive", "warmup_included",
 }
 
 
@@ -1240,6 +1286,44 @@ def _promote_canonical(metrics: dict, level: int, p: "PerfGuidellmSweepParams") 
     metrics["output_tps"] = level_metrics.get("output_tps_mean")
     metrics["reported_concurrency"] = level
     metrics["reported_level_meets_slo"] = 1.0 if _meets_slo(level_metrics, p) else 0.0
+    # How far to trust the reported numbers: stopped by its duration cap
+    # before finishing its requests, and/or rebuilt from requests that
+    # include warmup/cooldown (the count used, 0 = a normal measurement).
+    metrics["reported_level_truncated"] = float(level_metrics.get("truncated") or 0.0)
+    metrics["reported_level_warmup_included"] = float(level_metrics.get("warmup_included") or 0.0)
+
+
+def _level_is_empty(level_metrics: Optional[dict]) -> bool:
+    """True when the level's measurement window held no requests and nothing
+    could be rebuilt in its place: it has no values, only bookkeeping."""
+    return bool(level_metrics and level_metrics.get("empty_window"))
+
+
+def _level_has_data(out: "_ProbeOutcome") -> bool:
+    return out.level_metrics is not None and not _level_is_empty(out.level_metrics)
+
+
+def _level_inconclusive(level: int, level_metrics: dict) -> Optional[str]:
+    """Why a level's numbers are too thin or too optimistic for the auto
+    search to treat a pass as a pass, or None when they are usable.
+
+    - Empty: nothing measured.
+    - Rebuilt from warmup at c>1: the requests that finished were the first
+      wave, sent into an idle server with no queue, so its TTFT is better
+      than the level really delivers. (At c=1 there is no queue to build, so
+      a rebuilt c=1 level is accepted.)
+    - Fewer measured requests than one wave (c): not even one request per
+      slot made it into the sample.
+    """
+    if _level_is_empty(level_metrics):
+        return "it measured no requests"
+    if level > 1 and level_metrics.get("warmup_included"):
+        return (f"its numbers come from {level_metrics['warmup_included']:.0f} "
+                "request(s) of the first wave, sent into an idle server")
+    measured = level_metrics.get("measured_requests")
+    if measured is not None and measured < level:
+        return f"it measured {measured:.0f} request(s), less than one wave of {level}"
+    return None
 
 
 def _per_level_display_configs(metrics: dict) -> List[dict]:
@@ -1270,8 +1354,9 @@ _TRUNCATION_RATIO = 0.75
 def _warn_if_truncated(log_tag: str, tag: str, level: int, cap_seconds: float,
                        requests_per_concurrency: Optional[int],
                        level_metrics: Dict, wall_seconds: float,
-                       measured_fraction: float = _MEASURED_FRACTION) -> None:
-    """Log when a count-limited level did not finish its requests.
+                       measured_fraction: float = _MEASURED_FRACTION) -> bool:
+    """Log when a count-limited level did not finish its requests; return
+    whether it was truncated.
 
     A truncated level is the main source of run-to-run inconsistency in the
     search: it samples whatever happened to finish before the cap, so its
@@ -1285,16 +1370,16 @@ def _warn_if_truncated(log_tag: str, tag: str, level: int, cap_seconds: float,
         rounding in the warmup/cooldown split alone can look like a shortfall.
     """
     if not requests_per_concurrency:
-        return
+        return False
     measured = level_metrics.get("measured_requests")
     if measured is None:
-        return
+        return False
     requested = level * requests_per_concurrency
     expected = measured_fraction * requested
     if measured >= _TRUNCATION_RATIO * expected:
-        return
+        return False
     if wall_seconds < _TRUNCATION_RATIO * cap_seconds:
-        return  # ended well inside its cap — the cap is not what stopped it
+        return False  # ended well inside its cap — the cap is not what stopped it
     logger.warning(
         "[%s] %s c=%d measured only %.0f requests of the ~%.0f expected from "
         "its %d request budget (%d x %d per slot) — the %.0fs duration cap "
@@ -1304,6 +1389,7 @@ def _warn_if_truncated(log_tag: str, tag: str, level: int, cap_seconds: float,
         log_tag, tag, level, measured, expected, requested,
         level, requests_per_concurrency, cap_seconds,
     )
+    return True
 
 
 def _bracket_granularity(lo: int, explicit: int) -> int:
