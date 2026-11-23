@@ -123,6 +123,12 @@ def _normalize_extra_params(extra: SubmissionExtraParams | None) -> dict | None:
     per_module = {name: v for name, v in per_module.items() if v is not None}
     if per_module:
         bag["module_concurrency_overrides"] = per_module
+    if extra.bfcl_concurrency_grid is not None:
+        if any(c > settings.MAX_ALLOWED_CONCURRENCY for c in extra.bfcl_concurrency_grid):
+            raise HTTPException(422, "BFCL scan exceeds the allowed concurrency limit")
+        bag["bfcl_concurrency_grid"] = extra.bfcl_concurrency_grid
+    if extra.expected_benchmark_config_hash:
+        bag["expected_benchmark_config_hash"] = extra.expected_benchmark_config_hash
     return bag or None
 
 
@@ -266,6 +272,12 @@ async def submit_benchmark(
     _reject_unknown_override_modules(
         body.extra_params, {m.module_name for m in benchmark.modules}
     )
+    if body.extra_params and body.extra_params.bfcl_concurrency_grid is not None:
+        if [m.module_name for m in benchmark.modules] != ["bfcl_v4"]:
+            raise HTTPException(422, "BFCL scan requires a standalone BFCL benchmark")
+        expected = body.extra_params.expected_benchmark_config_hash
+        if expected and expected != benchmark.config_hash:
+            raise HTTPException(409, "Benchmark changed after this BFCL scan was queued")
     await _enforce_submission_quota(user, session)
 
     user_id = user.id
@@ -297,6 +309,7 @@ async def submit_benchmark(
             benchmark_module_id=mod.id,
             module_name=mod.module_name,
             params_json=mod.params_json,
+            metric_configs_json=mod.metric_configs_json if mod.module_name == "bfcl_v4" else None,
             status=ModuleRunStatus.PENDING,
         )
         session.add(run)
@@ -356,6 +369,8 @@ async def submit_module(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Module {name!r} not found")
 
     _reject_unknown_override_modules(body.extra_params, {name})
+    if body.extra_params and body.extra_params.bfcl_concurrency_grid is not None:
+        raise HTTPException(422, "Submit a standalone BFCL benchmark to run a concurrency scan")
     await _enforce_submission_quota(user, session)
 
     user_id = user.id

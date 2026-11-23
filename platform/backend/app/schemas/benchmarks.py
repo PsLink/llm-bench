@@ -221,6 +221,16 @@ class SubmissionExtraParams(BaseModel):
     # get the same two-stage clamp as the global override. Mutually exclusive
     # with `concurrency_override` — a submission picks one mechanism or neither.
     module_concurrency_overrides: dict[str, int] | None = None
+    bfcl_concurrency_grid: list[int] | None = Field(default=None, min_length=2, max_length=16)
+    expected_benchmark_config_hash: str | None = None
+
+    @field_validator("bfcl_concurrency_grid", mode="before")
+    @classmethod
+    def _strict_grid(cls, value):
+        if value is not None and (not isinstance(value, list)
+                                  or any(type(c) is not int for c in value)):
+            raise ValueError("BFCL scan requires integer concurrency points")
+        return value
 
     @model_validator(mode="after")
     def _one_override_mechanism(self) -> "SubmissionExtraParams":
@@ -229,6 +239,14 @@ class SubmissionExtraParams(BaseModel):
                 "concurrency_override and module_concurrency_overrides are "
                 "mutually exclusive — set one or the other, not both."
             )
+        if self.bfcl_concurrency_grid is not None:
+            grid = self.bfcl_concurrency_grid
+            if any(type(c) is not int or not 1 <= c <= 128 for c in grid):
+                raise ValueError("BFCL concurrency points must be integers in [1, 128]")
+            if grid != sorted(set(grid)):
+                raise ValueError("BFCL concurrency points must be unique and increasing")
+            if self.concurrency_override is not None or self.module_concurrency_overrides:
+                raise ValueError("BFCL scan cannot be combined with concurrency overrides")
         return self
 
 

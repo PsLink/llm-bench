@@ -324,3 +324,21 @@ def test_extra_params_schema_accepts_each_alone():
     both_empty = SubmissionExtraParams(
         concurrency_override=10, module_concurrency_overrides={})
     assert both_empty.concurrency_override == 10
+
+
+def test_bfcl_grid_schema_normalization_and_scalar_override_conflicts():
+    import pytest
+
+    from app.api.submissions import _normalize_extra_params
+    from app.schemas.benchmarks import SubmissionExtraParams
+
+    extra = SubmissionExtraParams(bfcl_concurrency_grid=[1, 3, 5, 6, 8],
+                                  expected_benchmark_config_hash="abc")
+    assert _normalize_extra_params(extra) == {
+        "bfcl_concurrency_grid": [1, 3, 5, 6, 8], "expected_benchmark_config_hash": "abc"}
+    for grid in ([1, 1], [4, 1], [0, 4], [1.0, 4], [True, 4]):
+        with pytest.raises(ValueError):
+            SubmissionExtraParams(bfcl_concurrency_grid=grid)
+    for override in ({"concurrency_override": 4}, {"module_concurrency_overrides": {"bfcl_v4": 4}}):
+        with pytest.raises(ValueError):
+            SubmissionExtraParams(bfcl_concurrency_grid=[1, 4], **override)

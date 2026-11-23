@@ -1212,6 +1212,14 @@ def _run_module_loop(
 
     from app.queue.log_capture import checkpoint_worker_log
 
+    scan_requested = (submission.extra_params or {}).get("bfcl_concurrency_grid") or any(
+        (getattr(mod, "params_json", None) or {}).get("concurrency_grid") for mod in modules)
+    benchmark = getattr(submission, "benchmark", None)
+    if scan_requested and benchmark is not None:
+        if benchmark.config_hash != submission.benchmark_config_hash:
+            _fail_submission(session, submission, "BFCL benchmark changed before scan execution")
+            return
+
     # Tracks whether the immediately-preceding module in run order blocked the
     # chain (failed, was skipped, or breached a redline). Drives the
     # skip_if_prev_failed cascade below.
@@ -1252,6 +1260,13 @@ def _run_module_loop(
             )
             session.add(run)
             session.flush()
+
+        bfcl_configs = None
+        if module_name == "bfcl_v4":
+            params_json = dict(run.params_json or params_json)
+            bfcl_configs = getattr(run, "metric_configs_json", None)
+            if bfcl_configs is None:
+                bfcl_configs = getattr(mod, "metric_configs_json", None) or []
 
         # Cascade skip: short-circuit this module (and, transitively, the rest of
         # the chain) when the immediately-preceding module blocked.
@@ -1297,7 +1312,18 @@ def _run_module_loop(
             # Pin a rolling dataset build BEFORE anything else touches params, so
             # the run's dataset can't change under it mid-flight.
             params = _resolve_dataset_feed(session, run, module_cls, params, module_name)
+            grid = (submission.extra_params or {}).get("bfcl_concurrency_grid")
+            if grid and module_name == "bfcl_v4":
+                if any(c > settings.MAX_ALLOWED_CONCURRENCY for c in grid):
+                    raise ValueError("BFCL scan exceeds the allowed concurrency limit")
+                params = module_cls.ParamsSchema(**{**params.model_dump(), "concurrency_grid": grid})
+            if getattr(params, "concurrency_grid", None):
+                from app.core.module_caps import resolve_concurrency_override
+                if resolve_concurrency_override(submission.extra_params, module_name) is not None:
+                    raise ValueError("BFCL scan cannot use a scalar concurrency override")
             params = _apply_concurrency_override(module_cls, params, submission, module_name)
+            if module_name == "bfcl_v4":
+                run.params_json = params.model_dump(exclude_none=True)
             _record_applied_concurrency(session, run, module_cls, params, submission)
             # Fold the user-cancel signal and the module time cap into one event
             # (see _start_module_deadline) and hand THAT to the module.
@@ -1315,6 +1341,7 @@ def _run_module_loop(
             session.commit()
             run_endpoint = replace(endpoint, run_context={
                 "submission_id": submission.id, "module_run_id": run.id,
+                "metric_configs": bfcl_configs or [],
             }) if module_name == "bfcl_v4" else endpoint
             try:
                 result = module_cls().run(
@@ -1337,7 +1364,8 @@ def _run_module_loop(
 
             # Resolve metric_configs: use benchmark-level config, fall back to module defaults
             from dataclasses import asdict
-            metric_configs: list = getattr(mod, "metric_configs_json", None) or []
+            metric_configs: list = (bfcl_configs if module_name == "bfcl_v4" else
+                                    getattr(mod, "metric_configs_json", None)) or []
             if not metric_configs:
                 metric_configs = [asdict(mc) for mc in module_cls.default_metric_configs]
             metric_configs = _merge_extra_display_configs(metric_configs, result)
@@ -1364,7 +1392,8 @@ def _run_module_loop(
         except (SubmissionCancelled, BenchmarkCancelled) as exc:
             artifacts = getattr(exc, "artifacts", [])
             if module_name == "bfcl_v4" and artifacts:
-                diagnostic = ModuleResult(artifacts=artifacts)
+                diagnostic = getattr(exc, "partial_result", None) or ModuleResult(artifacts=artifacts)
+                run.metrics_json = diagnostic.metrics
                 _persist_bfcl_artifacts(diagnostic, submission.id, run.id)
                 run.artifact_path = diagnostic.artifacts[0]
             # The module was handed one event for both signals, so disambiguate:

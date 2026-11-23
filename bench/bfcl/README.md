@@ -54,3 +54,27 @@ CI 在无外网的容器里运行 `python -m bench.bfcl.contract_test`，使用�
 闭环 cache off/on 对照须在两套已验证的服务配置上重复运行。核对两臂的 manifest `protocol_hash`，并记录模型部署标识、缓存开关和执行顺序。对比时同时看分项准确率、请求数、token 用量和缓存覆盖。
 
 固定请求对照可以先开启 `export_replay_trace`，将一次生成的 `trace.jsonl` 冻结到 Replay 数据目录，在两个候选的 Replay 模块配置中使用同一路径、并发、样本数和请求选项。使用 `summary.json` 中的 `trace_sha256` 核对文件，再检查 `trace-index.jsonl` 中的请求序号和请求体哈希。Replay 的 `cache_hit_rate` 以同时报告输入和缓存用量的成功请求为分母，`cache_usage_coverage` 显示覆盖比例。这里的 Replay 按独立请求调度。如需验证多轮前缀复用的因果时序，仍需按 case 调度请求。
+
+### Concurrency scans
+
+`bfcl_v4` accepts `concurrency_grid: [1, 3, 5, 6, 8]` (2–16 unique increasing
+integer points in 1–128). A single module run executes all points serially against
+the same endpoint. Fixed `concurrency` is ignored for a grid. Each point uses the
+existing pinned generator/evaluator in its own directory; each point's timing and
+telemetry are independent. Endpoint cache is shared, with no synthetic warmup or
+cache reset; an optional endpoint probe runs before the first point only.
+
+`max_seconds` caps each point. `max_total_seconds`, or the sum of per-point caps
+when omitted, bounds the entire scan. The worker derives its watchdog from this
+bound. Cancellation and budget expiry retain scan artifacts and completed points.
+
+The worker supplies frozen benchmark metric configs for per-point eligibility.
+Raw `c<N>` groups retain every point; top-level scalars select the highest total
+TPM meeting those rules (lower concurrency wins a tie). With no eligible point,
+scalars are diagnostic and the benchmark fails its rules. Any execution-invalid
+or missing-metric point makes the scan incomplete and unrankable.
+
+Submission overrides use `extra_params.bfcl_concurrency_grid` on standalone BFCL
+benchmarks; optional `expected_benchmark_config_hash` rejects queued protocol
+changes. Scalar concurrency overrides cannot be combined with scans. Effective
+params are persisted in the module-run snapshot, not inferred from defaults.
