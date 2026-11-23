@@ -142,6 +142,8 @@ def test_sweep_only_metrics_stay_out_of_the_single_module():
         "search_probes", "search_converged", "search_research_rounds",
         "search_tps_peak_concurrency",
         "drain_wait_seconds", "pre_level_canary_ms", "started_drained",
+        "truncated", "inconclusive",
+        "reported_level_truncated", "reported_level_warmup_included",
     }
     # Everything else the sweep declares, the single module declares too
     assert single - sweep == set()

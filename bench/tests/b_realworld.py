@@ -208,6 +208,36 @@ class RealWorldTest(GuideLLMBaseTest):
             m = bench["metrics"]
             s = lambda key: m[key]["successful"]  # noqa: E731
             suffix = f"_c{conc}"
+            totals = m["request_totals"]
+            total = totals.get("total") or 0
+
+            # Wall time of the whole level, warmup and cooldown included —
+            # what a duration cap is measured against (duration_seconds is
+            # only the measurement window).
+            if bench.get("start_time") is not None and bench.get("end_time") is not None:
+                metrics[f"run_seconds{suffix}"] = float(bench["end_time"]) - float(bench["start_time"])
+            metrics[f"measured_requests{suffix}"] = float(total)
+
+            errored = totals.get("errored") or 0
+            if total > 0:
+                # Measured, even when nothing in the window succeeded: an
+                # errored request is a real outcome.
+                metrics[f"uptime{suffix}"] = 1 - errored / total
+
+            if not totals.get("successful"):
+                # Empty measurement window: no request in it succeeded. Every
+                # finished request fell in warmup/cooldown (and
+                # rebuild_empty_windows could not use them), or the window
+                # holds only the request the cap cut off, or nothing finished
+                # at all. guidellm's statistics cover successful requests
+                # only, so it reports 0 for every one (and often a negative
+                # duration). Those zeros are placeholders, not measurements —
+                # a 0 ms TTFT would pass any latency cap and a 0 TPS would
+                # score as a dead service. Report the level as empty and leave
+                # its values missing, so everything downstream treats them as
+                # unknown.
+                metrics[f"empty_window{suffix}"] = 1.0
+                continue
 
             for _per in ('p50', 'p90', 'p99'):
                 metrics[f"input_tps_{_per}{suffix}"]  = s("prompt_tokens_per_second")["percentiles"][_per]
@@ -229,16 +259,12 @@ class RealWorldTest(GuideLLMBaseTest):
             # duration before reaching its request count produces a different
             # (and noisier) sample than one that ran to completion, and nothing
             # else in the output distinguishes the two.
-            if bench.get("duration") is not None:
+            if bench.get("duration") is not None and float(bench["duration"]) >= 0:
                 metrics[f"duration_seconds{suffix}"] = float(bench["duration"])
-            metrics[f"measured_requests{suffix}"] = float(
-                m["request_totals"].get("total") or 0
-            )
-
-            totals = m["request_totals"]
-            total = totals["total"]
-            errored = totals["errored"]
-            metrics[f"uptime{suffix}"] = (1 - errored / total) if total > 0 else 0.0
+            # Set by rebuild_empty_windows: the level's numbers come from this
+            # many requests, warmup/cooldown included (a thin sample).
+            if bench.get("warmup_included"):
+                metrics[f"warmup_included{suffix}"] = float(bench["warmup_included"])
 
         return metrics
 

@@ -45,6 +45,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   large replay, not 3 GiB) and say plainly that the run queue applies to every
   account, service accounts included.
 
+### Fixed
+
+- **A slow endpoint no longer comes back as a measured 0** (#34). When the
+  duration cap stopped a count-limited guidellm level with every finished
+  request inside warmup/cooldown, the measured window was empty, guidellm
+  reported 0 for every statistic, and the run was recorded as done with
+  score 0. Such a level is now rebuilt from the requests it finished
+  (per-request latencies with nearest-rank percentiles, rates over their
+  span), flagged with `warmup_included` (the requests used) and a warning.
+  This also covers a window holding only the request the cap cut off. When
+  the requests can't be used (none succeeded, or guidellm stored only a
+  sample of them), the level reports `empty_window=1` with no values, never
+  zeros, and a run whose reported level measured nothing ends with an error.
+- **The auto search no longer climbs on thin levels** (`perf_guidellm_sweep`).
+  A level that is empty, rebuilt from its first wave at c>1 (idle-server
+  latencies), or measured fewer requests than one wave counts as not
+  passing, marked `inconclusive=1`. With `slo_min_request_output_tps=0`, an
+  empty level used to pass, because its 0 ms TTFT met any cap.
+- Truncation is recorded, not only logged: every sweep level carries
+  `truncated` (grid mode too), and the reported level adds
+  `reported_level_truncated` and `reported_level_warmup_included`.
+
 ## [0.3.0] - 2026-10-15
 
 ### Added

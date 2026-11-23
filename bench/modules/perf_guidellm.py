@@ -163,6 +163,9 @@ class PerfGuidellmModule(_GuidellmBudgetMixin, TestModule):
         MetricDescriptor("reported_concurrency", "Reported Level",    "",      "Concurrency level the canonical metrics were taken from (the sweep's report_level param selects it; this module always reports the single level it ran)"),
         MetricDescriptor("duration_seconds",     "Measurement Window", "s",    "Length of the window the metrics describe — excludes the warmup and cooldown phases, so it is shorter than the run's wall-clock time"),
         MetricDescriptor("measured_requests",    "Measured Requests", "req",   "Requests counted in the reported metrics (warmup/cooldown excluded) — the sample size behind the percentiles. Far below what the run's duration or request-count cap should have produced means the sample was cut short, making the percentiles noisy and unstable between runs"),
+        MetricDescriptor("run_seconds",          "Level Wall Time",  "s",     "Wall-clock time the level ran, warmup and cooldown included — what its duration cap is measured against"),
+        MetricDescriptor("warmup_included",      "Warmup Requests Used", "",  "Requests this level's figures were rebuilt from, warmup/cooldown included, because no request finished inside the measurement window (a slow endpoint against a tight duration cap). Absent for a normal measurement. measured_requests then counts these same requests"),
+        MetricDescriptor("empty_window",         "Empty Window",     "",      "1 if no request finished inside the measurement window and none could be used in its place — the level has no values and the run reports an error"),
         # Card-normalized TPM — display-only comparison metrics computed by the
         # platform worker (the card count lives on the submission's hardware
         # section, which modules never see): raw throughput x 60 x baseline / card count.
@@ -230,6 +233,9 @@ class PerfGuidellmModule(_GuidellmBudgetMixin, TestModule):
             return ModuleResult(error="Backend failed to produce metrics")
 
         _promote_single_level_keys(metrics)
+        if metrics.get("empty_window"):
+            return ModuleResult(metrics=metrics, error=_EMPTY_WINDOW_ERROR.format(
+                level=f"concurrency {p.concurrency}"))
         # guidellm emits input_tps_mean / output_tps_mean; expose the canonical
         # bare names too, which is what benchmarks gate on.
         if "input_tps" not in metrics and "input_tps_mean" in metrics:
@@ -261,6 +267,16 @@ class PerfGuidellmModule(_GuidellmBudgetMixin, TestModule):
             log_tag="perf_guidellm",
         )
 
+
+# A level whose measured window came out empty, with no finished requests to
+# rebuild it from (bench.tests.base.rebuild_empty_windows): nothing was
+# measured, so a 0 score would be a fiction. Shared with perf_guidellm_sweep.
+_EMPTY_WINDOW_ERROR = (
+    "{level} measured no requests: none finished inside the measurement window "
+    "and none could be used in its place (see the run log). The endpoint is "
+    "too slow for the configured limits: raise the duration cap (max_seconds / "
+    "probe_seconds) or request_timeout, or lower the per-slot request count."
+)
 
 # Matches RealWorldTest's per-level suffix (`ttft_p99_ms_c8`). Kept local rather
 # than imported from perf_guidellm_sweep, which imports *from* this module.
