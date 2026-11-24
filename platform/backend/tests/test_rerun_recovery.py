@@ -245,6 +245,161 @@ def test_done_submission_is_not_rerun(session):
     assert session.get(Submission, sub_id).status == SubmissionStatus.DONE
 
 
+@pytest.mark.parametrize("accuracy, passed", [(0.5, False), (0.9, True)])
+def test_bfcl_retry_keeps_frozen_rules_through_final_scoring(session, monkeypatch, accuracy, passed):
+    from app.queue.jobs import run_submission
+    from bench.modules.bfcl_v4 import BFCLV4Module
+
+    frozen = [
+        {"key": "accuracy", "role": "redline", "min_val": 0.8},
+        {"key": "total_tpm", "role": "score", "formula": "passthrough"},
+        {"key": "admin_display", "role": "display"},
+    ]
+
+    class FakeBFCL(BFCLV4Module):
+        def run(self, endpoint, params, output_dir, progress_cb=None, cancel_event=None):
+            assert endpoint.run_context["metric_configs"] == frozen
+            return ModuleResult(
+                metrics={"accuracy": accuracy, "total_tpm": 1234, "current_attempt": 1},
+                extra_display_configs=[{"key": "current_attempt", "role": "display"}],
+            )
+
+    monkeypatch.setitem(MODULE_REGISTRY, "bfcl_v4", FakeBFCL)
+    if session.get(ModuleRow, "bfcl_v4") is None:
+        session.add(ModuleRow(
+            name="bfcl_v4", display_name="BFCL", description="x",
+            params_schema_json={}, default_params_json={}, metrics_schema_json={},
+        ))
+    sub_id, run_id = _make_killed_submission(session, SubmissionStatus.FAILED)
+    sub = session.get(Submission, sub_id)
+    sub.module_name = "bfcl_v4"
+    run = session.get(SubmissionRun, run_id)
+    run.module_name = "bfcl_v4"
+    run.frozen_metric_configs_json = frozen
+    run.metric_configs_json = [*frozen, {"key": "prior_attempt", "role": "display"}]
+    session.commit()
+
+    run_submission(sub_id)
+
+    session.expire_all()
+    sub = session.get(Submission, sub_id)
+    run = session.get(SubmissionRun, run_id)
+    assert sub.status == SubmissionStatus.DONE
+    assert run.status == ModuleRunStatus.DONE
+    assert run.passed is sub.passed is passed
+    assert run.score == sub.score_total == 1234
+    assert run.frozen_metric_configs_json == frozen
+    assert run.metric_configs_json[:len(frozen)] == frozen
+    keys = {c["key"] for c in run.metric_configs_json}
+    assert "current_attempt" in keys and "prior_attempt" not in keys
+
+
+def _make_finishing_bfcl_scan(session):
+    if session.get(ModuleRow, "bfcl_v4") is None:
+        session.add(ModuleRow(
+            name="bfcl_v4", display_name="BFCL", description="x",
+            params_schema_json={}, default_params_json={}, metrics_schema_json={},
+        ))
+    sub_id, run_id = _make_killed_submission(session, SubmissionStatus.RUNNING)
+    sub = session.get(Submission, sub_id)
+    sub.module_name = "bfcl_v4"
+    sub.passed, sub.score_total = True, 1234
+    run = session.get(SubmissionRun, run_id)
+    run.module_name = "bfcl_v4"
+    run.params_json = {"concurrency_grid": [1, 2]}
+    run.status = ModuleRunStatus.DONE
+    run.passed, run.score = True, 1234
+    run.error = None
+    run.metrics_json = {"accuracy": 0.9, "total_tpm": 1234, "sweep_canceled": 0, "sweep_complete": 1}
+    session.commit()
+    return sub_id, run_id, sub.user_id
+
+
+def _cancel_from_fresh_session(sub_id, user_id, application_name):
+    import asyncio
+    from types import SimpleNamespace
+
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+    from app.api.submissions import cancel_submission
+
+    async def cancel():
+        engine = create_async_engine(settings.DATABASE_URL, connect_args={
+            "server_settings": {"application_name": application_name},
+        })
+        try:
+            async with AsyncSession(engine, expire_on_commit=False) as session:
+                return await cancel_submission(sub_id, SimpleNamespace(id=user_id, role="user"), session)
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(cancel())
+
+
+def test_cancel_endpoint_invalidates_a_scan_that_already_committed_its_run(session):
+    sub_id, run_id, user_id = _make_finishing_bfcl_scan(session)
+    # Release the caller's read transaction before the independent API request.
+    session.commit()
+    response = _cancel_from_fresh_session(sub_id, user_id, "bfcl-cancel-after-run")
+    assert response.status == "canceled" and response.passed is False
+    session.expire_all()
+    sub = session.get(Submission, sub_id)
+    run = session.get(SubmissionRun, run_id)
+    assert sub.status == SubmissionStatus.CANCELED and sub.passed is False
+    assert run.status == ModuleRunStatus.FAILED and run.passed is False
+    assert run.score == sub.score_total == 0
+    assert run.metrics_json["sweep_canceled"] == 1
+    assert run.metrics_json["sweep_complete"] == 0
+    assert run.metrics_json["accuracy"] == 0.9
+
+
+def test_cancel_request_waiting_on_finalization_cannot_overwrite_done(session):
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import closing
+
+    import psycopg2
+    from fastapi import HTTPException
+
+    sub_id, run_id, user_id = _make_finishing_bfcl_scan(session)
+    sub = session.get(Submission, sub_id)
+    session.refresh(sub, with_for_update=True)
+    tag = f"bfcl-cancel-race-{sub_id}"
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_cancel_from_fresh_session, sub_id, user_id, tag)
+        try:
+            # Wait for PostgreSQL to confirm the API request is blocked by the
+            # worker's finalization lock. No scheduling sleeps or timing guesses.
+            with closing(psycopg2.connect(settings.DATABASE_URL_SYNC)) as observer:
+                observer.autocommit = True
+                with observer.cursor() as cursor:
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        cursor.execute(
+                            "SELECT 1 FROM pg_stat_activity WHERE application_name=%s "
+                            "AND wait_event_type='Lock'", (tag,),
+                        )
+                        if cursor.fetchone():
+                            break
+                        if future.done():
+                            future.result()
+                            pytest.fail("cancel request bypassed the finalization lock")
+                    else:
+                        pytest.fail("cancel request did not reach the finalization lock")
+            sub.status = SubmissionStatus.DONE
+            session.commit()
+            with pytest.raises(HTTPException) as exc:
+                future.result(timeout=10)
+            assert exc.value.status_code == 409
+        finally:
+            session.rollback()
+    session.expire_all()
+    assert session.get(Submission, sub_id).status == SubmissionStatus.DONE
+    run = session.get(SubmissionRun, run_id)
+    assert run.status == ModuleRunStatus.DONE and run.passed is True
+    assert run.metrics_json["sweep_canceled"] == 0
+
+
 def test_resurrection_is_bounded_by_run_attempts(session):
     """A killed worker's message is redelivered forever otherwise.
 

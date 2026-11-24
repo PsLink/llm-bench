@@ -10,7 +10,7 @@ from pathlib import Path
 import signal
 import subprocess
 import time
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -39,6 +39,15 @@ MANIFESTS = {
 # contiguous zero-based IDs and at least 200 official cases.
 MAX_TOOL_USE_CASES_PER_CATEGORY = 200
 
+# The platform actor has a 48-hour limit. Leave an hour for setup, artifact
+# persistence and teardown, including when the total budget is implicit.
+BFCL_SCAN_MAX_SECONDS = 47 * 3600
+BFCL_SCAN_METRIC_KEYS = frozenset({
+    "reported_concurrency", "sweep_complete", "sweep_canceled", "sweep_timed_out",
+    "sweep_points_attempted", "sweep_points_completed", "sweep_points_planned",
+    "sweep_stop_reason",
+})
+
 
 class BFCLV4Params(BaseModel):
     task_set: Literal[
@@ -53,6 +62,12 @@ class BFCLV4Params(BaseModel):
         description="Number of cases per category for tool-use and multi-turn-long-context task sets, selected by ascending case ID.",
     )
     concurrency: int = Field(2, ge=1, le=128)
+    concurrency_grid: list[Annotated[int, Field(strict=True, ge=1, le=128)]] | None = Field(
+        default=None, min_length=2, max_length=16)
+    max_total_seconds: float | None = Field(
+        default=None, ge=1, le=BFCL_SCAN_MAX_SECONDS,
+        description="Scan budget in seconds; at most 47 hours including all concurrency points.",
+    )
     request_timeout_seconds: float = Field(120, ge=1, le=3600)
     max_seconds: float = Field(1800, ge=1, le=86400)
     request_retries: int = Field(0, ge=0, le=3)
@@ -72,6 +87,14 @@ class BFCLV4Params(BaseModel):
             raise ValueError(
                 "bfcl-v4-smoke-v1 has a fixed case count; use bfcl-v4-tool-use-v1 to select more"
             )
+        if self.concurrency_grid is not None:
+            if self.concurrency_grid != sorted(set(self.concurrency_grid)):
+                raise ValueError("concurrency_grid must be strictly increasing and unique")
+            budget = self.max_total_seconds or self.max_seconds * len(self.concurrency_grid)
+            if budget > BFCL_SCAN_MAX_SECONDS:
+                raise ValueError(
+                    "BFCL scan budget exceeds 47 hours; reduce max_seconds or set max_total_seconds"
+                )
         return self
 
 
@@ -128,6 +151,13 @@ class BFCLV4Module(TestModule):
         MetricDescriptor(name, name.replace("_", " "), unit, higher_is_better=higher)
         for name, unit, higher in [
             ("accuracy", "", True),
+            ("reported_concurrency", "cases", True),
+            ("sweep_complete", "", True),
+            ("sweep_canceled", "", False),
+            ("sweep_timed_out", "", False),
+            ("sweep_points_attempted", "", True),
+            ("sweep_points_completed", "", True),
+            ("sweep_points_planned", "", True),
             ("accuracy_simple_python", "", True),
             ("accuracy_multi_turn_base", "", True),
             ("accuracy_multi_turn_long_context", "", True),
@@ -184,7 +214,133 @@ class BFCLV4Module(TestModule):
         ],
     ]
 
-    def run(
+    @classmethod
+    def time_budget_seconds(cls, params):
+        if params.concurrency_grid:
+            return params.max_total_seconds or params.max_seconds * len(params.concurrency_grid)
+        return params.max_seconds
+
+    def run(self, endpoint, params, output_dir, progress_cb=_noop_progress, cancel_event=None):
+        if params.concurrency_grid:
+            return self._run_grid(endpoint, params, output_dir, progress_cb, cancel_event)
+        return self._run_single(endpoint, params, output_dir, progress_cb, cancel_event)
+
+    def _run_grid(self, endpoint, params, output_dir, progress_cb, cancel_event):
+        from bench.modules.evaluator import evaluate
+
+        root = Path(output_dir) / uuid4().hex
+        root.mkdir(parents=True)
+        index = root / "artifacts.json"
+        result = ModuleResult(artifacts=[str(index)])
+        grid = params.concurrency_grid
+        deadline = time.monotonic() + self.time_budget_seconds(params)
+        configs = endpoint.run_context.get("metric_configs") or []
+        # Aggregate metrics do not exist on a child point. Their rules still
+        # participate in the protocol hash and the worker's final evaluation.
+        point_configs = [c for c in configs if c.get("key") not in BFCL_SCAN_METRIC_KEYS]
+        levels = {}
+        canceled = None
+        stop_reason = ""
+        timed_out = False
+        active_concurrency = None
+        try:
+            for i, concurrency in enumerate(grid):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise BenchmarkCancelled("BFCL scan canceled")
+                remaining = deadline - time.monotonic()
+                if remaining < 1:
+                    timed_out = True
+                    stop_reason = "BFCL scan exceeded its total wall-clock budget"
+                    break
+                point = params.model_copy(update={
+                    "concurrency_grid": None, "max_total_seconds": None,
+                    "concurrency": concurrency, "max_seconds": min(params.max_seconds, remaining),
+                    "probe_endpoint": params.probe_endpoint and i == 0,
+                })
+                active_concurrency = concurrency
+                child = self._run_single(
+                    endpoint, point, str(root / f"c{concurrency}"),
+                    lambda fraction, message, i=i, c=concurrency: progress_cb(
+                        (i + fraction) / len(grid), f"c{c}: {message}"),
+                    cancel_event,
+                )
+                required = ["total_tpm", *[c["key"] for c in point_configs
+                                         if c.get("role") in ("score", "redline")]]
+                valid = not child.error and all(
+                    isinstance(child.metrics.get(k), (int, float))
+                    and math.isfinite(child.metrics[k]) for k in required)
+                _, eligible = evaluate(child.metrics, point_configs)
+                levels[f"c{concurrency}"] = {
+                    **child.metrics, "valid": int(valid), "eligible": int(valid and eligible),
+                    "case_concurrency": concurrency,
+                }
+                if not valid:
+                    error = child.error or "Missing required point metrics"
+                    levels[f"c{concurrency}"]["error"] = error
+                    _write_json(root / f"c{concurrency}" / "failure.json", {"error": error})
+                result.metrics.update(levels)
+                active_concurrency = None
+            if cancel_event is not None and cancel_event.is_set():
+                raise BenchmarkCancelled("BFCL scan canceled")
+        except BenchmarkCancelled as exc:
+            timeout_event = getattr(cancel_event, "bfcl_timeout_event", None)
+            if timeout_event is not None and timeout_event.is_set():
+                timed_out = True
+                stop_reason = "BFCL scan exceeded the worker time budget"
+            else:
+                canceled = exc
+                stop_reason = result.error = "BFCL scan canceled"
+            if active_concurrency is not None:
+                levels[f"c{active_concurrency}"] = {
+                    "valid": 0, "eligible": 0, "case_concurrency": active_concurrency,
+                    "error": stop_reason,
+                }
+                result.metrics.update(levels)
+        finally:
+            # Keep a representative even on cancellation for diagnostics; the
+            # cancellation flag always prevents it from ranking or becoming a best level.
+            passing = [(k, v) for k, v in levels.items() if v["eligible"]]
+            diagnostic = [(k, v) for k, v in levels.items() if v["valid"]]
+            choices = passing or diagnostic
+            if choices:
+                key, best = max(choices, key=lambda kv: (
+                    kv[1]["total_tpm"], -kv[1]["case_concurrency"]))
+                result.metrics.update({k: v for k, v in best.items()
+                                       if k not in ("valid", "eligible", "error")})
+                result.metrics["reported_concurrency"] = int(key[1:])
+            elif canceled is None:
+                result.error = stop_reason or "BFCL scan produced no valid concurrency point"
+            complete = len(levels) == len(grid) and all(v["valid"] for v in levels.values())
+            result.metrics.update(
+                sweep_complete=int(complete and canceled is None),
+                sweep_canceled=int(canceled is not None), sweep_timed_out=int(timed_out),
+                sweep_stop_reason=stop_reason, sweep_points_attempted=len(levels),
+                sweep_points_completed=sum(v["valid"] for v in levels.values()),
+                sweep_points_planned=len(grid),
+            )
+            result.extra_display_configs = [
+                {"key": f"{level}.{metric}", "role": "display"}
+                for level, values in levels.items() for metric, value in values.items()
+                if isinstance(value, (int, float))
+            ]
+            protocol = {"params": params.model_dump(exclude_none=True), "redlines": configs}
+            _write_json(root / "scan.json", {
+                "protocol_hash": hashlib.sha256(json.dumps(
+                    protocol, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                "version": 1, "concurrency_grid": grid, "order": "ascending",
+                "cache_policy": "shared endpoint cache; no reset; no synthetic warmup",
+                "metrics": result.metrics, "error": result.error,
+            })
+            _write_json(index, {"version": 1, "error": result.error,
+                               "files": [str(p.relative_to(root)) for p in sorted(root.rglob("*"))
+                                         if p.is_file() and p != index]})
+        if canceled:
+            canceled.artifacts = result.artifacts
+            canceled.partial_result = result
+            raise canceled
+        return result
+
+    def _run_single(
         self,
         endpoint: EndpointConfig,
         params,

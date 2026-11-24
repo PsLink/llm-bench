@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
@@ -320,9 +321,10 @@ def _reset_submission_for_retry(session, submission) -> None:
 
     Preserves SubmissionRun rows (so row IDs stay stable for any SSE subscriber
     still listening) but clears every result-bearing field on both the
-    submission and its runs. Partial-resume of already-DONE modules is
-    intentionally not supported — restarting from scratch is preferred over
-    silently mixing prior and new results.
+    submission and its runs. Frozen benchmark rules are inputs and survive;
+    display rows appended by a completed attempt are discarded. Partial-resume
+    of already-DONE modules is intentionally not supported — restarting from
+    scratch is preferred over silently mixing prior and new results.
     """
     from app.db.models import SubmissionRun, ModuleRunStatus
     runs = session.query(SubmissionRun).filter_by(submission_id=submission.id).all()
@@ -333,7 +335,16 @@ def _reset_submission_for_retry(session, submission) -> None:
         r.score = None
         r.passed = None
         r.metrics_json = None
-        r.metric_configs_json = []
+        if r.module_name == "bfcl_v4":
+            frozen_configs = getattr(r, "frozen_metric_configs_json", None)
+            if frozen_configs is None:
+                # Legacy runs may only have the original snapshot. Preserve it
+                # rather than replacing its rules with current benchmark rules.
+                frozen_configs = r.metric_configs_json
+                r.frozen_metric_configs_json = deepcopy(frozen_configs)
+            r.metric_configs_json = deepcopy(frozen_configs)
+        else:
+            r.metric_configs_json = []
         r.error = None
         r.artifact_path = None
     submission.error = None
@@ -1208,9 +1219,19 @@ def _run_module_loop(
 ) -> None:
     """Inner module loop. Kept separate so _run_modules can wrap it in try/finally
     for watcher cleanup without re-indenting the whole body on every refactor."""
-    from app.db.models import SubmissionRun, ModuleRunStatus, SubmissionStatus
+    from app.db.models import Benchmark, SubmissionRun, ModuleRunStatus, SubmissionStatus
 
     from app.queue.log_capture import checkpoint_worker_log
+
+    scan_requested = (submission.extra_params or {}).get("bfcl_concurrency_grid") or any(
+        (getattr(mod, "params_json", None) or {}).get("concurrency_grid") for mod in modules)
+    if scan_requested and submission.benchmark_id is not None:
+        # Submission.benchmark uses lazy='raise' and is not loaded by the worker.
+        # Query explicitly, and only for scans that need the frozen config check.
+        benchmark = session.get(Benchmark, submission.benchmark_id)
+        if benchmark is None or benchmark.config_hash != submission.benchmark_config_hash:
+            _fail_submission(session, submission, "BFCL benchmark changed before scan execution")
+            return
 
     # Tracks whether the immediately-preceding module in run order blocked the
     # chain (failed, was skipped, or breached a redline). Drives the
@@ -1252,6 +1273,18 @@ def _run_module_loop(
             )
             session.add(run)
             session.flush()
+
+        bfcl_configs = None
+        if module_name == "bfcl_v4":
+            params_json = dict(run.params_json or params_json)
+            bfcl_configs = getattr(run, "frozen_metric_configs_json", None)
+            if bfcl_configs is None:
+                bfcl_configs = getattr(run, "metric_configs_json", None)
+            if bfcl_configs is None:
+                bfcl_configs = getattr(mod, "metric_configs_json", None) or []
+            # Freeze legacy / worker-created rows before execution, so even a
+            # hard crash cannot make the next attempt consume display entries.
+            run.frozen_metric_configs_json = deepcopy(bfcl_configs)
 
         # Cascade skip: short-circuit this module (and, transitively, the rest of
         # the chain) when the immediately-preceding module blocked.
@@ -1297,7 +1330,18 @@ def _run_module_loop(
             # Pin a rolling dataset build BEFORE anything else touches params, so
             # the run's dataset can't change under it mid-flight.
             params = _resolve_dataset_feed(session, run, module_cls, params, module_name)
+            grid = (submission.extra_params or {}).get("bfcl_concurrency_grid")
+            if grid and module_name == "bfcl_v4":
+                if any(c > settings.MAX_ALLOWED_CONCURRENCY for c in grid):
+                    raise ValueError("BFCL scan exceeds the allowed concurrency limit")
+                params = module_cls.ParamsSchema(**{**params.model_dump(), "concurrency_grid": grid})
+            if getattr(params, "concurrency_grid", None):
+                from app.core.module_caps import resolve_concurrency_override
+                if resolve_concurrency_override(submission.extra_params, module_name) is not None:
+                    raise ValueError("BFCL scan cannot use a scalar concurrency override")
             params = _apply_concurrency_override(module_cls, params, submission, module_name)
+            if module_name == "bfcl_v4":
+                run.params_json = params.model_dump(exclude_none=True)
             _record_applied_concurrency(session, run, module_cls, params, submission)
             # Fold the user-cancel signal and the module time cap into one event
             # (see _start_module_deadline) and hand THAT to the module.
@@ -1305,6 +1349,8 @@ def _run_module_loop(
             abort_event, timed_out, stop_deadline = _start_module_deadline(
                 submission.id, module_name, cancel_event, time_cap
             )
+            if module_name == "bfcl_v4":
+                abort_event.bfcl_timeout_event = timed_out
             progress_cb = _make_progress_cb(submission.id, run.id, module_name, abort_event)
             # Close out any transaction the setup above opened (params, the
             # concurrency override, the run row) BEFORE handing control to a module
@@ -1315,6 +1361,7 @@ def _run_module_loop(
             session.commit()
             run_endpoint = replace(endpoint, run_context={
                 "submission_id": submission.id, "module_run_id": run.id,
+                "metric_configs": bfcl_configs or [],
             }) if module_name == "bfcl_v4" else endpoint
             try:
                 result = module_cls().run(
@@ -1332,12 +1379,21 @@ def _run_module_loop(
                     progress_cb=progress_cb,
                 )
 
+            if module_name == "bfcl_v4" and getattr(params, "concurrency_grid", None):
+                session.refresh(submission)
+                if submission.status == SubmissionStatus.CANCELED:
+                    result.metrics["sweep_canceled"] = 1
+                    result.error = "BFCL scan canceled"
+                    exc = BenchmarkCancelled(result.error)
+                    exc.artifacts, exc.partial_result = result.artifacts, result
+                    raise exc
             _add_card_normalized_tpm(result, submission, module_cls, module_name)
             _add_dataset_identity(result, run, module_cls, module_name)
 
             # Resolve metric_configs: use benchmark-level config, fall back to module defaults
             from dataclasses import asdict
-            metric_configs: list = getattr(mod, "metric_configs_json", None) or []
+            metric_configs: list = (bfcl_configs if module_name == "bfcl_v4" else
+                                    getattr(mod, "metric_configs_json", None)) or []
             if not metric_configs:
                 metric_configs = [asdict(mc) for mc in module_cls.default_metric_configs]
             metric_configs = _merge_extra_display_configs(metric_configs, result)
@@ -1356,6 +1412,15 @@ def _run_module_loop(
             else:
                 result.score, result.passed = evaluate(result.metrics, metric_configs)
 
+            # Serialize the verdict write with the cancel endpoint. Artifact
+            # persistence and evaluation happen before acquiring this short lock.
+            session.refresh(submission, with_for_update=True)
+            if (submission.status == SubmissionStatus.CANCELED and module_name == "bfcl_v4"
+                    and getattr(params, "concurrency_grid", None)):
+                from app.core.cancellation import canceled_scan_metrics
+                result.metrics = canceled_scan_metrics(result.metrics)
+                result.error = "BFCL scan canceled"
+                result.score, result.passed = 0.0, False
             _complete_run(session, run, result, metric_configs)
             logger.info(
                 "Submission %d module %s done — passed=%s score=%.4f",
@@ -1364,7 +1429,8 @@ def _run_module_loop(
         except (SubmissionCancelled, BenchmarkCancelled) as exc:
             artifacts = getattr(exc, "artifacts", [])
             if module_name == "bfcl_v4" and artifacts:
-                diagnostic = ModuleResult(artifacts=artifacts)
+                diagnostic = getattr(exc, "partial_result", None) or ModuleResult(artifacts=artifacts)
+                run.metrics_json = diagnostic.metrics
                 _persist_bfcl_artifacts(diagnostic, submission.id, run.id)
                 run.artifact_path = diagnostic.artifacts[0]
             # The module was handed one event for both signals, so disambiguate:
@@ -1408,8 +1474,9 @@ def _run_module_loop(
         # finished — pinning which module killed the worker.
         checkpoint_worker_log(submission.id)
 
-    # Re-read status in case it was canceled while the worker was running
-    session.refresh(submission)
+    # This lock and the cancel endpoint's row lock make DONE vs CANCELED a
+    # serialized decision, including cancellation after the last run commit.
+    session.refresh(submission, with_for_update=True)
 
     # Aggregate scores (do this AFTER refresh so the values survive the commit)
     if results:
@@ -1446,8 +1513,25 @@ def _run_module_loop(
             submission.id, submission.passed, submission.score_total, len(results),
         )
     else:
+        from app.core.cancellation import apply_cancellation
+        canceled_runs = apply_cancellation(
+            submission, session.query(SubmissionRun).filter_by(submission_id=submission.id).all(),
+        )
+        for result in results:
+            if result is not _SKIPPED_RESULT:
+                result.passed = False
         logger.info("Submission %d worker exiting — already marked CANCELED", submission.id)
     session.commit()
+    if submission.status == SubmissionStatus.CANCELED:
+        # A scan may have emitted a passing event just before cancellation.
+        for canceled_run in canceled_runs:
+            _publish_run_event(submission.id, {
+                "event": "run_complete", "run_id": canceled_run.id,
+                "module_name": canceled_run.module_name, "status": "failed",
+                "score": 0.0, "passed": False, "metrics": canceled_run.metrics_json,
+                "metric_configs": canceled_run.metric_configs_json,
+                "error": canceled_run.error,
+            })
 
 
 def _fail_run(session, run, error: str) -> None:

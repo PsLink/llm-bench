@@ -433,6 +433,9 @@ class SubmissionRun(Base):
     passed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     metrics_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     metric_configs_json: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # Submission-time BFCL rules, kept separate from metric_configs_json, which
+    # also contains display rows appended by the completed attempt.
+    frozen_metric_configs_json: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(nullable=True)

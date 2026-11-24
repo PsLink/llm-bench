@@ -1,6 +1,21 @@
-# BFCL V4 冒烟验证
+# BFCL V4 integration
 
-此入口执行冻结 manifest 中的一条单轮题和一条多轮题。它用原生工具调用跑官方非流式生成，校验生成结果的题目覆盖与推理异常，再调用官方部分评分。请在能访问测试推理服务的 Python 3.12 环境执行。
+LLMBench runs selected BFCL V4 cases through the official generator and evaluator
+at revision `6ea57973c7a6097fd7c5915698c54c17c5b1b6c8`. These are subsets, not the
+full BFCL leaderboard. The integration provides two entry points:
+
+- [`bench.bfcl.smoke`](smoke.py): a standalone, non-streaming check of two fixed cases.
+- [`bfcl_v4`](../modules/bfcl_v4.py): the platform module, with streaming generation,
+  telemetry, optional endpoint probing and Replay export, and concurrency scans.
+
+Run the shell commands below from the repository root. Deployment instructions
+are in the [repository README](../../README.md) and [deployment guide](../../docs/deploying.md).
+For programmatic submission and result consumption, see the
+[AutoTune API guide](../../docs/api/for-autotune.md).
+
+## Standalone smoke check
+
+Use Python 3.12, Git, and an accessible OpenAI-compatible Chat Completions endpoint:
 
 ```sh
 python3.12 -m venv /tmp/llmbench-bfcl-venv
@@ -13,44 +28,289 @@ bfcl_rev=$("$bfcl_python" -c 'import json; print(json.load(open("bench/bfcl/smok
   --output-dir /tmp/llmbench-bfcl-smoke-001
 ```
 
-需要认证时通过进程环境提供 `BFCL_ENDPOINT_API_KEY`。每次运行指定一个新目录。从 `result/` 检查两题的生成记录，在 `score/` 检查官方分类结果。若要验收多轮流程，目标端点还须产生工具调用，并在端点的请求记录中核对工具返回和调用 ID。这里固定了 BFCL 源码版本，生产 worker 的传递依赖锁和镜像构建仍需单独验收。
+Set `BFCL_ENDPOINT_API_KEY` in the process environment if authentication is
+required. Without a key, the handler removes the SDK's placeholder Authorization
+header. Use a new output directory for each invocation; an existing directory is
+rejected.
 
-## 在 LLMBench worker 上运行
+The smoke manifest selects `simple_python_0` and `multi_turn_base_0`, with
+concurrency 2 and temperature 0.001. The command verifies the installed BFCL
+revision, runs native tool-call generation without streaming, checks exact case
+coverage and inference errors, then invokes official partial evaluation and
+checks scoring coverage. Inspect `result/` for generated records and `score/`
+for category scores. A successful command does **not** imply that the model
+answered either case correctly; inspect the scores and tool-call exchange.
 
-从空白单机开始测试模块见 [Docker Compose 从零部署指南](../../docs/bfcl-v4-fresh-deployment.zh.md)。
+This installation pins BFCL source, but resolves transitive dependencies at
+installation time. Use the image build below when a locked dependency
+environment is required.
 
-部署、真实端点和 Autotune 的逐步验收见 [生产验收执行指南](../../docs/bfcl-v4-production-acceptance.zh.md)。
+## Worker environment
 
-Linux AMD64 后端镜像会在构建时安装锁定的 BFCL 环境。依赖下载完成后，安装和 CLI 自检在无网络环境下进行。ARM64 镜像仍可运行其余模块。使用备用环境时，通过 `BFCL_PYTHON` 指向安装了固定 BFCL 版本的解释器。
+The [backend Dockerfile](../../platform/backend/Dockerfile) builds a separate
+Python 3.12 BFCL environment for Linux AMD64 using
+[`requirements.lock`](requirements.lock). The final image sets
+`BFCL_PYTHON=/opt/bfcl/bin/python`. The ARM64 build omits this BFCL environment;
+provide a compatible interpreter through `BFCL_PYTHON` to run BFCL there or in a
+custom worker environment. The runner checks its installed BFCL revision.
 
-构建依赖默认要求 wheel，仅 `google-search-results==2.4.2` 使用上游源码包：锁文件校验该源码包的 SHA256，联网阶段从同一锁文件安装固定版本的 `setuptools`、`wheel` 和 `packaging`，用于源码包元数据处理；最终 BFCL 虚拟环境中的构建、安装和 CLI 自检仍在 `--network=none` 阶段完成。下载和安装保留 `--require-hashes`，使用 `--no-build-isolation` 阻止 pip 自动创建隔离构建环境并安装额外构建依赖。
+The BFCL build downloads dependencies and the pinned source checkout with network
+access. Dependency artifacts are hash-checked. Wheels are required except for
+`google-search-results==2.4.2`, whose source archive is built using pinned
+`setuptools`, `wheel`, and `packaging`. Installation into the final BFCL virtual
+environment, source builds, `pip check`, and BFCL CLI checks run in a
+`--network=none` stage with build isolation disabled. The BFCL source itself is
+installed from the separately fetched, revision-pinned checkout.
 
-网络环境需要镜像源时，可传入 `--build-arg BFCL_PIP_INDEX_URL=https://your-mirror/simple` 和 `--build-arg BFCL_PIP_TIMEOUT=600`；默认仍使用 PyPI，仓库不绑定特定部署机器的镜像源。
+For a package mirror or a slower connection, the BFCL build accepts:
 
-在管理端导入 [benchmark 配置](../../benchmarks/bfcl-v4-tool-use-v1.yaml)。模块默认的 `bfcl-v4-smoke-v1` 适合端点冒烟。benchmark 配置选择 `bfcl-v4-tool-use-v1`，覆盖参数、工具选择、并行调用、无关工具和多轮五类题。两套题集的 runner revision 一致，manifest 会记录实际并发、超时、重试和协议哈希。默认执行零预热和零重试。需要重试时设置 `request_retries`，仅在收到 HTTP 429 或 5xx 且流未打开时重试。
+```sh
+docker build --platform linux/amd64 --target bfcl-builder -f platform/backend/Dockerfile \
+  --build-arg BFCL_PIP_INDEX_URL=https://your-mirror/simple \
+  --build-arg BFCL_PIP_TIMEOUT=600 \
+  -t llmbench-bfcl-ci .
+```
 
-五类题集支持 `cases_per_category`（1–200，默认 1）。它从固定 BFCL revision 的每类题目中按编号升序取前 N 道。设置 `cases_per_category: 2` 后正式评测共 10 题。实际题目 ID 写入 manifest 并参与协议哈希。比较候选时保持协议一致。冒烟题集和可选探测仍使用各自的固定题目。
+These arguments apply to the BFCL dependency stage. The backend environment and
+tokenizer have separate build settings described in the Dockerfile.
 
-单独评测长上下文多轮工具调用时，选择 `task_set: bfcl-v4-multi-turn-long-context-v1`，或导入[独立 benchmark 配置](../../benchmarks/bfcl-v4-multi-turn-long-context-v1.yaml)。此题集只包含 `multi_turn_long_context`，使用相同固定 BFCL revision，支持 `cases_per_category: 1–200`（默认 1），按编号升序取前 N 题，总题数为 N。分项指标为 `accuracy_multi_turn_long_context` 和 `case_count_multi_turn_long_context`。长上下文主要在工具返回后累积；运行更多题目时应按端点性能调整 `max_seconds`。若开启 `probe_endpoint`，仍会额外执行独立的 `multi_turn_base_0` 探测，该题不计入正式评测。
+## Task sets and parameters
 
-进度包括官方生成和评分两个阶段。设置 `required_metrics` 可阻止缺报指标进入排名，也可用 `min_ttft_coverage`、`min_usage_coverage` 和 `min_cache_usage_coverage` 设覆盖下限。缓存实测零满足覆盖要求。
+All three manifests use the same pinned BFCL revision and temperature 0.001.
+The module defaults to the smoke task set, `cases_per_category: 1`, and
+`concurrency: 2`.
 
-Docker Compose 通过共享卷保留 attempt 压缩包。Helm 部署通过 `bfclArtifacts.enabled=true` 和 `bfclArtifacts.existingClaim` 挂载现有 RWX PVC。配置共享卷的部署可由提交者或管理员请求 `GET /submissions/{submission_id}/runs/{run_id}/artifacts` 下载。归档保留期限由部署侧的存储策略管理。
+| `task_set` | Categories | Measured cases |
+| --- | --- | --- |
+| `bfcl-v4-smoke-v1` | `simple_python`, `multi_turn_base` | Two fixed cases; `cases_per_category` must be 1 |
+| `bfcl-v4-tool-use-v1` | `simple_python`, `multiple`, `parallel`, `irrelevance`, `multi_turn_base` | `5 × cases_per_category` |
+| `bfcl-v4-multi-turn-long-context-v1` | `multi_turn_long_context` | `cases_per_category` |
 
-## 可选端点探测
+The tool-use and long-context sets accept 1–200 cases per category. They select
+the contiguous IDs `<category>_0` through `<category>_<N-1>` from the pinned
+revision. The resolved IDs are written to each attempt's `manifest.json` and
+participate in its `protocol_hash`.
 
-在 `bfcl_v4` 的模块参数中设置 `probe_endpoint: true`，正式生成前会用官方 BFCL runner 串行跑一次固定题 `multi_turn_base_0`。探测只执行生成，报告位于 `probe/probe.json`，列出是否观察到原生工具调用、端点是否接受带匹配 `tool_call_id` 的工具结果，以及完整流式 usage 的样本数。模型没有发出工具调用时，相应字段为 `false`，表示本次未观察到。探测中的 HTTP 或 runner 错误会使模块失败并保留诊断。
+Importable benchmark examples are available for
+[tool use](../../benchmarks/bfcl-v4-tool-use-v1.yaml) and
+[long-context multi-turn](../../benchmarks/bfcl-v4-multi-turn-long-context-v1.yaml).
+The tool-use example selects one case per category at concurrency 2. The
+long-context example selects **200 cases at concurrency 1**, despite the module's
+one-case default. Adjust the case count and time budget for the endpoint being
+tested. Long-context input grows through tool results and subsequent turns.
 
-探测流量单独记录，不计入正式评分、生成性能指标或 Replay 轨迹，但占用模块总时限。探测默认关闭，冷缓存实验时请保持关闭并在独立窗口验证端点。
+Key runtime parameters:
 
-## 验证与缓存对照
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `concurrency` | 2 | Concurrent cases, from 1 to 128; requests within a case remain ordered |
+| `request_timeout_seconds` | 120 | Logical model-call deadline, including any configured retry backoff; range 1–3600 seconds |
+| `max_seconds` | 1800 | Total budget for one point, including probe, generation, and evaluation; range 1–86400 seconds |
+| `request_retries` | 0 | Up to 3 retries for HTTP 429 or 5xx, only before a stream has been opened |
+| `probe_endpoint` | `false` | Run the separate endpoint probe before measured generation |
+| `export_replay_trace` | `false` | Export measured request bodies and a provenance index |
+| `required_metrics` | `[accuracy]` | Reject a point if a listed metric is absent, non-numeric, or non-finite |
 
-CI 在无外网的容器里运行 `python -m bench.bfcl.contract_test`，使用回环模拟服务核对同一题集的非流式与流式官方评分、请求认证、工具调用 ID 回填、并发重叠和题内请求顺序。
+The streaming handler requests `stream_options.include_usage=true`. It does not
+retry partial streams, transport failures without a retryable HTTP status, or
+other HTTP errors. SDK retries are disabled. There is no synthetic warmup and no
+automatic endpoint cache reset.
 
-`llmbench-stream-v2` 启用官方评分器的 `underscore_to_dot` 配置，使评分时的预期函数名与 OpenAI 工具定义中的点号转下划线规则一致。契约测试覆盖单工具、工具选择和并行调用中的带点函数名。旧版结果可能因此低估准确率，应新建提交复测；handler 版本参与 `protocol_hash`，新旧结果的协议哈希不同。
+`min_ttft_coverage`, `min_usage_coverage`, and `min_cache_usage_coverage` default
+to zero and accept values in [0, 1]. The usage threshold applies separately to
+input and output coverage. Both shipped benchmark YAMLs additionally require
+`passed_cases_per_hour` and `ttft_p90_ms`, and set `min_ttft_coverage: 1.0`.
+These point-level checks run before scan-level aggregate metrics exist; configure
+aggregate requirements as benchmark metric rules instead.
 
-`input_tpm` 和 `output_tpm` 分别为现有输入、输出 token/s 的 60 倍，使用正式生成阶段的总墙钟时间（包含并发和多轮等待，不含评分、探测时间）。缺报时应结合对应的 usage coverage 判断；没有样本或生成时长不可用时返回 null。`total_tpm` 是二者之和，仅在输入和输出 usage 覆盖率均为 100% 时提供，避免把部分上报数据当作完整总吞吐。三项均为展示指标，不影响准确率评分。
+## Metrics and scoring
 
-闭环 cache off/on 对照须在两套已验证的服务配置上重复运行。核对两臂的 manifest `protocol_hash`，并记录模型部署标识、缓存开关和执行顺序。对比时同时看分项准确率、请求数、token 用量和缓存覆盖。
+The official evaluator determines case success. Overall `accuracy` is successful
+cases divided by measured cases; each category also exposes
+`accuracy_<category>` and `case_count_<category>`. Generation and grading wall
+times are reported separately. `passed_cases_per_hour` uses successful cases and
+the measured generation wall time, excluding grading and the optional probe.
 
-固定请求对照可以先开启 `export_replay_trace`，将一次生成的 `trace.jsonl` 冻结到 Replay 数据目录，在两个候选的 Replay 模块配置中使用同一路径、并发、样本数和请求选项。使用 `summary.json` 中的 `trace_sha256` 核对文件，再检查 `trace-index.jsonl` 中的请求序号和请求体哈希。Replay 的 `cache_hit_rate` 以同时报告输入和缓存用量的成功请求为分母，`cache_usage_coverage` 显示覆盖比例。这里的 Replay 按独立请求调度。如需验证多轮前缀复用的因果时序，仍需按 case 调度请求。
+TTFT starts at the HTTP attempt and ends at the first nonempty text content or
+tool function name/arguments. Reasoning-only chunks and tool IDs alone do not
+count as first output. Latency percentiles, TTFT coverage, and input/output usage
+coverage use successful measured HTTP attempts. The aggregate `usage_coverage`
+instead uses all measured HTTP attempts, including failed retries. HTTP
+attempt/error/retry counts are also reported.
+
+- `input_tpm` and `output_tpm` are the corresponding token/s rates multiplied by
+  60. Their denominator is total measured generation wall time, including
+  concurrent execution and multi-turn waiting, excluding probe and grading.
+  Partial usage reporting can produce partial rates; inspect coverage alongside
+  them. Missing samples or unavailable wall time produce `null`.
+- `total_tpm` is their sum, available only when input and output usage coverage
+  are both 100% among successful measured requests. Scans require a finite
+  `total_tpm` to consider a point valid.
+- `cache_hit_rate` is **token-weighted**: cached input tokens divided by input
+  tokens across successful requests reporting both values. It is not a fraction
+  of requests. `cache_usage_coverage` is the fraction of successful requests with
+  valid paired values. Missing cache usage is not treated as zero; an explicitly
+  reported zero cached-token count is a valid sample. A zero input-token
+  denominator produces a `null` hit rate. BFCL also reports `_first` and
+  `_subsequent` variants, split by request index within each case.
+
+The worker applies the benchmark's `metric_configs` to compute score and pass/fail.
+The module default and shipped YAMLs score accuracy and have **no accuracy
+redline**. Add an explicit `role: redline` rule to enforce a quality floor. TPM
+metrics are displayed by default, but can be configured as score or redline
+terms; `total_tpm` also drives scan selection. Display-only defaults do not
+prevent such benchmark overrides.
+
+The `llmbench-stream-v2` handler enables the official evaluator's
+`underscore_to_dot` setting, matching the dot-to-underscore conversion in OpenAI
+tool schemas. Its version participates in the attempt protocol hash. Results
+from older handler versions can have different accuracy for dotted function
+names and should be rerun before comparison.
+
+## Optional endpoint probe
+
+With `probe_endpoint: true`, the official runner first generates the fixed
+`multi_turn_base_0` case at concurrency 1, without scoring it. The resulting
+`probe/probe.json` reports whether it observed native tool calls, a successful
+request containing a tool result with a previously observed `tool_call_id`, and
+complete input/output usage samples.
+
+These are observations from that execution: `false` can mean the model never
+issued a tool call. HTTP or runner errors fail the point and retain diagnostics.
+Probe traffic is excluded from measured accuracy, performance metrics, and
+Replay export, but consumes the point's time budget. In a scan, it runs only for
+the first point. Keep it disabled during cold-cache measurements and validate
+the endpoint separately.
+
+## Concurrency scans
+
+Set `concurrency_grid: [1, 3, 5, 6, 8]` in module parameters to execute 2–16
+strictly increasing, unique integer points in [1, 128]. One module run executes
+the points serially against the same endpoint. Each point uses its own attempt
+directory and timing/telemetry. The scalar `concurrency` parameter is ignored.
+Endpoint cache is shared across points without reset or synthetic warmup.
+
+`max_seconds` caps each point. `max_total_seconds`, when supplied, bounds the
+whole scan; otherwise the budget is `max_seconds × len(concurrency_grid)`.
+**Both explicit and implicit scan budgets must be at most 169,200 seconds
+(47 hours)**, leaving one hour below the worker actor's 48-hour limit. An explicit
+total budget can be smaller than the sum of point caps; each point is limited
+by the remaining scan budget. The worker derives its cooperative watchdog from
+the declared budget.
+
+The worker supplies the submission's frozen metric rules. Point selection checks
+finite `total_tpm`, the required point-level score/redline metrics, and point-level
+redlines. It then selects the eligible point with the highest `total_tpm`, breaking
+ties in favor of lower concurrency. The representative point's metrics become
+top-level scalars; each attempted point remains under `c<N>` with `valid`,
+`eligible`, and any point error. Unattempted points have no `c<N>` entry.
+
+The following metrics are created after the point loop, so their score/redline
+rules are evaluated only by the worker after aggregation:
+
+| Metric | Meaning |
+| --- | --- |
+| `reported_concurrency` | Representative point, including a diagnostic fallback when no point qualifies |
+| `sweep_complete` | 1 when every planned point is valid and the scan was not canceled; a valid point can still fail a quality redline |
+| `sweep_canceled` | 1 when user cancellation invalidates the scan |
+| `sweep_timed_out` | 1 when the scan's total or worker time budget expires; an individual point timeout alone does not set this flag |
+| `sweep_points_attempted` | Number of recorded points, including a point interrupted by cancellation |
+| `sweep_points_completed` | Number of valid points |
+| `sweep_points_planned` | Number of configured grid points |
+
+If no point is eligible, the fastest valid point is retained for diagnostics and
+its point-level rules fail final evaluation. With no valid point, the scan
+returns an error. Failed points and budget expiry do not automatically reject an
+otherwise eligible representative: add scan-level redlines when complete
+execution is required. For example, a benchmark module can use:
+
+```yaml
+params:
+  task_set: bfcl-v4-tool-use-v1
+  concurrency_grid: [1, 3, 5, 6, 8]
+  max_seconds: 1800
+  max_total_seconds: 9000
+metric_configs:
+  - key: total_tpm
+    role: score
+    formula: passthrough
+  - key: accuracy
+    role: redline
+    min_val: 0.8
+  - key: sweep_complete
+    role: redline
+    min_val: 1
+  - key: sweep_timed_out
+    role: redline
+    max_val: 0
+```
+
+Accepted cancellation always prevents ranking, even if a point already passed
+or a run result was committed before cancellation. The submission has
+`passed=false`; the scan run is `failed`, with `passed=false`, `sweep_canceled=1`,
+and `sweep_complete=0`. Partial diagnostics are retained. Cancellation and final
+completion are serialized; cancellation of an already completed submission is
+rejected. For cancellations after artifact creation, use the persisted API
+verdict rather than an archive's earlier metrics.
+
+Submission overrides use `extra_params.bfcl_concurrency_grid` on a standalone
+BFCL benchmark. They cannot be combined with scalar concurrency overrides.
+Optional `expected_benchmark_config_hash` rejects a mismatch at submission time;
+the worker also checks the stored benchmark hash before executing a queued scan.
+Effective parameters and submission-time scoring rules are persisted. Worker
+retries restart execution, preserve those rules, and discard prior runtime
+display entries.
+
+## Artifacts and Replay comparisons
+
+Each point attempt records its resolved `manifest.json`, `params.json`,
+`identity.json`, official `result/` and `score/` files, request/case events,
+`case_results.jsonl`, `summary.json`, and `artifacts.json` as those stages
+complete. Failed attempts can contain only partial outputs. A scan adds its own
+`scan.json` and an artifact index covering the point directories. Temporary
+`config.json` files are removed and excluded from published archives.
+
+Docker Compose mounts shared artifact storage for the API and worker. Helm
+requires `bfclArtifacts.enabled=true` and `bfclArtifacts.existingClaim` naming
+an existing shared RWX PVC. With `BFCL_ARTIFACT_DIR` configured on both services,
+the submission owner or an administrator can download the archive referenced by
+the run through `GET /submissions/{submission_id}/runs/{run_id}/artifacts`,
+relative to the API base URL. Storage lifecycle policy controls archive retention.
+
+For a cache off/on comparison, repeat the same protocol against two verified
+service configurations. Compare the attempt manifest hashes for corresponding
+points, and record model/deployment identity, cache settings, and execution
+order separately. A scan's `scan.json` hash also covers its effective parameters
+and frozen metric configs. Different concurrency points have different attempt
+hashes. Compare category accuracy, request counts, token usage, and cache
+coverage alongside throughput.
+
+For fixed-request comparisons, enable `export_replay_trace` and copy the
+resulting `trace.jsonl` into the [Replay dataset storage](../../docs/replay-datasets.md).
+Use the same file, concurrency, sample count, and request options on both Replay
+candidates. The file hash is `summary.json` → `metrics.trace_sha256`;
+`trace-index.jsonl` records case/request indices, protocol hash, and request-body
+hashes. Probe requests are excluded. Replay schedules the captured requests
+independently; it does not reproduce the original per-case causal sequence.
+Use case-ordered execution when testing multi-turn prefix-cache reuse.
+
+## Offline integration contract
+
+CI builds the locked Linux AMD64 BFCL environment, then runs the official
+generator/evaluator against a loopback fixture without external networking.
+The commands require an AMD64 Docker host or working AMD64 emulation:
+
+```sh
+docker build --platform linux/amd64 --target bfcl-builder -f platform/backend/Dockerfile \
+  -t llmbench-bfcl-ci .
+docker run --platform linux/amd64 --rm --network none -v "$PWD:/app:ro" -w /app \
+  llmbench-bfcl-ci /opt/bfcl/bin/python -m bench.bfcl.contract_test
+```
+
+The contract compares streaming and non-streaming official scores on the smoke
+subset and exercises all five tool-use categories with two cases each. It also
+checks authentication, tool-call ID round trips, concurrent case overlap,
+ordered requests within a case, usage/cache telemetry, and the optional probe.
+It covers dotted function names in single-tool, tool-selection, and parallel
+calls. This fixture check does not replace validation against the target model
+endpoint.

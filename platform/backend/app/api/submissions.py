@@ -8,6 +8,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
+from copy import deepcopy
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -123,6 +124,12 @@ def _normalize_extra_params(extra: SubmissionExtraParams | None) -> dict | None:
     per_module = {name: v for name, v in per_module.items() if v is not None}
     if per_module:
         bag["module_concurrency_overrides"] = per_module
+    if extra.bfcl_concurrency_grid is not None:
+        if any(c > settings.MAX_ALLOWED_CONCURRENCY for c in extra.bfcl_concurrency_grid):
+            raise HTTPException(422, "BFCL scan exceeds the allowed concurrency limit")
+        bag["bfcl_concurrency_grid"] = extra.bfcl_concurrency_grid
+    if extra.expected_benchmark_config_hash:
+        bag["expected_benchmark_config_hash"] = extra.expected_benchmark_config_hash
     return bag or None
 
 
@@ -266,6 +273,24 @@ async def submit_benchmark(
     _reject_unknown_override_modules(
         body.extra_params, {m.module_name for m in benchmark.modules}
     )
+    if body.extra_params and body.extra_params.bfcl_concurrency_grid is not None:
+        if [m.module_name for m in benchmark.modules] != ["bfcl_v4"]:
+            raise HTTPException(422, "BFCL scan requires a standalone BFCL benchmark")
+        expected = body.extra_params.expected_benchmark_config_hash
+        if expected and expected != benchmark.config_hash:
+            raise HTTPException(409, "Benchmark changed after this BFCL scan was queued")
+        # Validate the effective grid before enqueueing: a valid per-point
+        # budget can exceed the actor limit once multiplied by the grid size.
+        from pydantic import ValidationError
+        from bench.modules.bfcl_v4 import BFCLV4Params
+        try:
+            BFCLV4Params(**{
+                **(benchmark.modules[0].params_json or {}),
+                "concurrency_grid": body.extra_params.bfcl_concurrency_grid,
+            })
+        except ValidationError as exc:
+            errors = "; ".join(err["msg"] for err in exc.errors())
+            raise HTTPException(422, f"Invalid BFCL scan params: {errors}") from exc
     await _enforce_submission_quota(user, session)
 
     user_id = user.id
@@ -297,6 +322,8 @@ async def submit_benchmark(
             benchmark_module_id=mod.id,
             module_name=mod.module_name,
             params_json=mod.params_json,
+            metric_configs_json=mod.metric_configs_json if mod.module_name == "bfcl_v4" else None,
+            frozen_metric_configs_json=deepcopy(mod.metric_configs_json) if mod.module_name == "bfcl_v4" else None,
             status=ModuleRunStatus.PENDING,
         )
         session.add(run)
@@ -356,6 +383,8 @@ async def submit_module(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Module {name!r} not found")
 
     _reject_unknown_override_modules(body.extra_params, {name})
+    if body.extra_params and body.extra_params.bfcl_concurrency_grid is not None:
+        raise HTTPException(422, "Submit a standalone BFCL benchmark to run a concurrency scan")
     await _enforce_submission_quota(user, session)
 
     user_id = user.id
@@ -436,7 +465,7 @@ async def cancel_submission(
 ):
     """Cancel a queued or running submission. Only the owner or an admin can cancel."""
     result = await session.execute(
-        select(Submission).where(Submission.id == submission_id)
+        select(Submission).where(Submission.id == submission_id).with_for_update()
     )
     submission = result.scalar_one_or_none()
     if submission is None:
@@ -458,6 +487,9 @@ async def cancel_submission(
     )
     submission.status = SubmissionStatus.CANCELED
     submission.finished_at = datetime.utcnow()
+    from app.core.cancellation import apply_cancellation
+    runs = await session.execute(select(SubmissionRun).where(SubmissionRun.submission_id == submission_id))
+    apply_cancellation(submission, runs.scalars().all())
     await session.commit()
     await session.refresh(submission)
     logger.info("Submission %d marked CANCELED", submission_id)
