@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
@@ -320,9 +321,10 @@ def _reset_submission_for_retry(session, submission) -> None:
 
     Preserves SubmissionRun rows (so row IDs stay stable for any SSE subscriber
     still listening) but clears every result-bearing field on both the
-    submission and its runs. Partial-resume of already-DONE modules is
-    intentionally not supported — restarting from scratch is preferred over
-    silently mixing prior and new results.
+    submission and its runs. Frozen benchmark rules are inputs and survive;
+    display rows appended by a completed attempt are discarded. Partial-resume
+    of already-DONE modules is intentionally not supported — restarting from
+    scratch is preferred over silently mixing prior and new results.
     """
     from app.db.models import SubmissionRun, ModuleRunStatus
     runs = session.query(SubmissionRun).filter_by(submission_id=submission.id).all()
@@ -333,7 +335,16 @@ def _reset_submission_for_retry(session, submission) -> None:
         r.score = None
         r.passed = None
         r.metrics_json = None
-        r.metric_configs_json = []
+        if r.module_name == "bfcl_v4":
+            frozen_configs = getattr(r, "frozen_metric_configs_json", None)
+            if frozen_configs is None:
+                # Legacy runs may only have the original snapshot. Preserve it
+                # rather than replacing its rules with current benchmark rules.
+                frozen_configs = r.metric_configs_json
+                r.frozen_metric_configs_json = deepcopy(frozen_configs)
+            r.metric_configs_json = deepcopy(frozen_configs)
+        else:
+            r.metric_configs_json = []
         r.error = None
         r.artifact_path = None
     submission.error = None
@@ -1266,9 +1277,14 @@ def _run_module_loop(
         bfcl_configs = None
         if module_name == "bfcl_v4":
             params_json = dict(run.params_json or params_json)
-            bfcl_configs = getattr(run, "metric_configs_json", None)
+            bfcl_configs = getattr(run, "frozen_metric_configs_json", None)
+            if bfcl_configs is None:
+                bfcl_configs = getattr(run, "metric_configs_json", None)
             if bfcl_configs is None:
                 bfcl_configs = getattr(mod, "metric_configs_json", None) or []
+            # Freeze legacy / worker-created rows before execution, so even a
+            # hard crash cannot make the next attempt consume display entries.
+            run.frozen_metric_configs_json = deepcopy(bfcl_configs)
 
         # Cascade skip: short-circuit this module (and, transitively, the rest of
         # the chain) when the immediately-preceding module blocked.

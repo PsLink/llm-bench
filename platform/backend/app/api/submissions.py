@@ -8,6 +8,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
+from copy import deepcopy
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -310,6 +311,7 @@ async def submit_benchmark(
             module_name=mod.module_name,
             params_json=mod.params_json,
             metric_configs_json=mod.metric_configs_json if mod.module_name == "bfcl_v4" else None,
+            frozen_metric_configs_json=deepcopy(mod.metric_configs_json) if mod.module_name == "bfcl_v4" else None,
             status=ModuleRunStatus.PENDING,
         )
         session.add(run)

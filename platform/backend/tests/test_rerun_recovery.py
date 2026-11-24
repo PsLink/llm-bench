@@ -245,6 +245,55 @@ def test_done_submission_is_not_rerun(session):
     assert session.get(Submission, sub_id).status == SubmissionStatus.DONE
 
 
+@pytest.mark.parametrize("accuracy, passed", [(0.5, False), (0.9, True)])
+def test_bfcl_retry_keeps_frozen_rules_through_final_scoring(session, monkeypatch, accuracy, passed):
+    from app.queue.jobs import run_submission
+    from bench.modules.bfcl_v4 import BFCLV4Module
+
+    frozen = [
+        {"key": "accuracy", "role": "redline", "min_val": 0.8},
+        {"key": "total_tpm", "role": "score", "formula": "passthrough"},
+        {"key": "admin_display", "role": "display"},
+    ]
+
+    class FakeBFCL(BFCLV4Module):
+        def run(self, endpoint, params, output_dir, progress_cb=None, cancel_event=None):
+            assert endpoint.run_context["metric_configs"] == frozen
+            return ModuleResult(
+                metrics={"accuracy": accuracy, "total_tpm": 1234, "current_attempt": 1},
+                extra_display_configs=[{"key": "current_attempt", "role": "display"}],
+            )
+
+    monkeypatch.setitem(MODULE_REGISTRY, "bfcl_v4", FakeBFCL)
+    if session.get(ModuleRow, "bfcl_v4") is None:
+        session.add(ModuleRow(
+            name="bfcl_v4", display_name="BFCL", description="x",
+            params_schema_json={}, default_params_json={}, metrics_schema_json={},
+        ))
+    sub_id, run_id = _make_killed_submission(session, SubmissionStatus.FAILED)
+    sub = session.get(Submission, sub_id)
+    sub.module_name = "bfcl_v4"
+    run = session.get(SubmissionRun, run_id)
+    run.module_name = "bfcl_v4"
+    run.frozen_metric_configs_json = frozen
+    run.metric_configs_json = [*frozen, {"key": "prior_attempt", "role": "display"}]
+    session.commit()
+
+    run_submission(sub_id)
+
+    session.expire_all()
+    sub = session.get(Submission, sub_id)
+    run = session.get(SubmissionRun, run_id)
+    assert sub.status == SubmissionStatus.DONE
+    assert run.status == ModuleRunStatus.DONE
+    assert run.passed is sub.passed is passed
+    assert run.score == sub.score_total == 1234
+    assert run.frozen_metric_configs_json == frozen
+    assert run.metric_configs_json[:len(frozen)] == frozen
+    keys = {c["key"] for c in run.metric_configs_json}
+    assert "current_attempt" in keys and "prior_attempt" not in keys
+
+
 def test_resurrection_is_bounded_by_run_attempts(session):
     """A killed worker's message is redelivered forever otherwise.
 

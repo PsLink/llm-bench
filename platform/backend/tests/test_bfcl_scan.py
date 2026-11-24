@@ -19,9 +19,10 @@ from app.schemas.benchmarks import SubmissionExtraParams
 from bench.modules.base import BenchmarkCancelled, BenchmarkTimeout, EndpointConfig
 
 
+@pytest.mark.parametrize("retry", [False, True])
 @pytest.mark.parametrize("failure", [None, "timeout", "cancel", "late_cancel", "quality", "all"])
 def test_worker_executes_and_freezes_the_submission_grid_without_point_fanout(
-    tmp_path, monkeypatch, failure,
+    tmp_path, monkeypatch, failure, retry,
 ):
     monkeypatch.setenv("BFCL_PYTHON", sys.executable)
     grid = [1, 3, 5, 6, 8]
@@ -30,17 +31,29 @@ def test_worker_executes_and_freezes_the_submission_grid_without_point_fanout(
                                  benchmark_config_hash="frozen",
                                  status=SubmissionStatus.RUNNING, cards_per_machine=2,
                                  machine_count=1, card_type="A100", passed=None)
+    frozen_configs = [
+        {"key": "accuracy", "role": "redline", "min_val": 0.8},
+        {"key": "total_tpm", "role": "score", "formula": "passthrough"},
+        {"key": "admin_display", "role": "display"},
+    ]
     run = SimpleNamespace(id=42, module_name="bfcl_v4", params_json={
         "concurrency": 2, "request_timeout_seconds": 45},
-        metric_configs_json=[{"key": "accuracy", "role": "redline", "min_val": 0.8}],
+        metric_configs_json=list(frozen_configs),
+        frozen_metric_configs_json=list(frozen_configs),
                           submission_id=41, status=ModuleRunStatus.PENDING)
     session = MagicMock()
     session.get.return_value = Benchmark(id=1, config_hash="frozen")
     session.query.return_value.filter_by.return_value.first.return_value = run
+    if retry:
+        # A previous attempt completed this module before the worker crashed.
+        run.metric_configs_json.append({"key": "prior_attempt_only", "role": "display"})
+        session.query.return_value.filter_by.return_value.all.return_value = [run]
+        jobs._reset_submission_for_retry(session, submission)
     mod = SimpleNamespace(id=1, module_name="bfcl_v4", weight=1, order_index=0,
                           params_json={"concurrency": 2}, metric_configs_json=[
                               {"key": "accuracy", "role": "redline", "min_val": 0.99}])
-    for name in ("_publish_run_event", "_persist_bfcl_artifacts", "_release_dataset_pin"):
+    for name in ("_publish_run_event", "_publish_progress_event",
+                 "_persist_bfcl_artifacts", "_release_dataset_pin"):
         monkeypatch.setattr(jobs, name, lambda *args, **kwargs: None)
     monkeypatch.setattr("app.queue.log_capture.checkpoint_worker_log", lambda *args: None)
     monkeypatch.setattr(jobs, "_start_module_deadline", lambda *args: (
@@ -85,12 +98,78 @@ def test_worker_executes_and_freezes_the_submission_grid_without_point_fanout(
     assert len(results) == 1
     assert run.metrics_json["sweep_canceled"] == 0
     assert run.metrics_json["sweep_complete"] == int(failure not in ("timeout", "all"))
+    assert run.frozen_metric_configs_json == frozen_configs
+    assert run.metric_configs_json[:len(frozen_configs)] == frozen_configs
+    assert "prior_attempt_only" not in {c["key"] for c in run.metric_configs_json}
     if failure in ("quality", "all"):
         assert not run.passed and not submission.passed
     else:
         assert run.metrics_json["reported_concurrency"] == 6
         assert run.passed and run.status == ModuleRunStatus.DONE
         assert submission.passed
+    if failure != "all":
+        expected_score = 8000 if failure == "quality" else 6000
+        assert run.score == submission.score_total == expected_score
+    if retry:
+        # A further redelivery must also discard this attempt's display rows.
+        assert any(c["key"].startswith("c1.") for c in run.metric_configs_json)
+        jobs._reset_submission_for_retry(session, submission)
+        assert run.metric_configs_json == run.frozen_metric_configs_json == frozen_configs
+
+
+@pytest.mark.parametrize("configs", [None, [], [
+    {"key": "accuracy", "role": "redline", "min_val": 0.8},
+    {"key": "admin_display", "role": "display"},
+]])
+def test_retry_preserves_legacy_bfcl_snapshot_and_missing_config_fallback(configs):
+    from app.db.models import SubmissionRun
+
+    run = SubmissionRun(module_name="bfcl_v4", metric_configs_json=configs)
+    submission = Submission(id=41)
+    session = MagicMock()
+    session.query.return_value.filter_by.return_value.all.return_value = [run]
+    jobs._reset_submission_for_retry(session, submission)
+    assert run.metric_configs_json == configs
+    assert run.frozen_metric_configs_json == configs
+    if configs:
+        run.metric_configs_json.append({"key": "runtime_only", "role": "display"})
+        jobs._reset_submission_for_retry(session, submission)
+        assert run.metric_configs_json == configs
+
+
+def test_submit_freezes_bfcl_rules_separately_from_display_snapshot(monkeypatch):
+    import asyncio
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+
+    from app.api import submissions
+    from app.db.models import SubmissionRun
+    from app.schemas.benchmarks import SubmissionCreate
+
+    configs = [{"key": "accuracy", "role": "redline", "min_val": 0.8}]
+    mod = SimpleNamespace(id=1, module_name="bfcl_v4", params_json={}, metric_configs_json=configs)
+    benchmark = SimpleNamespace(id=1, config_hash="frozen", modules=[mod])
+    session = MagicMock()
+    session.execute = AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: benchmark))
+    session.commit = AsyncMock()
+    session.refresh = AsyncMock()
+    added = []
+    session.add.side_effect = added.append
+
+    async def flush():
+        added[0].id = 41
+        added[0].created_at = datetime.now()
+
+    session.flush = AsyncMock(side_effect=flush)
+    monkeypatch.setattr(submissions, "_reject_if_cordoned", AsyncMock())
+    monkeypatch.setattr(submissions, "_enforce_submission_quota", AsyncMock())
+    monkeypatch.setattr(jobs, "enqueue_submission", lambda *args: None)
+    body = SubmissionCreate(endpoint_url="http://localhost/v1", model="m")
+    asyncio.run(submissions.submit_benchmark("bfcl", body, SimpleNamespace(id=1), session))
+    run = next(row for row in added if isinstance(row, SubmissionRun))
+    assert run.metric_configs_json == run.frozen_metric_configs_json == configs
+    run.metric_configs_json.append({"key": "runtime_only", "role": "display"})
+    assert run.frozen_metric_configs_json == configs[:1]
 
 
 def test_changed_benchmark_is_rejected_before_running_queued_points(tmp_path):
