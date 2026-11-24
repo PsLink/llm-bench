@@ -15,7 +15,7 @@ from bench.modules.bfcl_v4 import BFCLV4Module, BFCLV4Params
 
 class BFCLGridTest(unittest.TestCase):
     def execute(self, points, *, bad=None, cancel=None, missing=None, timeout=False,
-                failure_type=RuntimeError, accuracy=None):
+                failure_type=RuntimeError, accuracy=None, configs=None):
         seen = []
         roots = []
         def process(command, **kwargs):
@@ -41,7 +41,8 @@ class BFCLGridTest(unittest.TestCase):
             os.environ, {"BFCL_PYTHON": sys.executable}
         ), patch("bench.modules.bfcl_v4.run_process", side_effect=process):
             endpoint = EndpointConfig("http://localhost/v1", "model", "secret", run_context={
-                "metric_configs": [{"key": "accuracy", "role": "redline", "min_val": 0.8}]})
+                "metric_configs": configs if configs is not None else [
+                    {"key": "accuracy", "role": "redline", "min_val": 0.8}]})
             try:
                 result = BFCLV4Module().run(endpoint, params, output, cancel_event=threading.Event())
             except BenchmarkCancelled as exc:
@@ -95,6 +96,33 @@ class BFCLGridTest(unittest.TestCase):
                 BFCLV4Params(concurrency_grid=grid)
         params = BFCLV4Params(concurrency_grid=[1, 4, 8], max_seconds=60)
         self.assertEqual(BFCLV4Module.time_budget_seconds(params), 180)
+
+    def test_scan_rules_do_not_invalidate_points(self):
+        from bench.modules.evaluator import evaluate
+
+        configs = [
+            {"key": "accuracy", "role": "redline", "min_val": 0.8},
+            *[{"key": key, "role": "redline", "min_val": value, "max_val": value}
+              for key, value in {"sweep_complete": 1, "sweep_canceled": 0,
+                                 "sweep_timed_out": 0, "sweep_points_attempted": 3,
+                                 "sweep_points_completed": 3, "sweep_points_planned": 3,
+                                 "reported_concurrency": 3}.items()],
+            {"key": "reported_concurrency", "role": "score", "formula": "passthrough"},
+        ]
+        result, _, _ = self.execute([1, 3, 8], configs=configs)
+        self.assertIsNone(result.error)
+        self.assertEqual(result.metrics["reported_concurrency"], 3)
+        self.assertEqual(result.metrics["c8"]["eligible"], 0)
+        self.assertEqual(evaluate(result.metrics, configs), (3.0, True))
+
+    def test_scan_budget_leaves_headroom_below_actor_limit(self):
+        for kwargs in ({"max_total_seconds": 1382400}, {"max_seconds": 86400},
+                       {"max_total_seconds": 47 * 3600 + 1}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                BFCLV4Params(concurrency_grid=list(range(1, 17)), **kwargs)
+        for kwargs in ({"max_total_seconds": 47 * 3600}, {"max_seconds": 47 * 1800}):
+            params = BFCLV4Params(concurrency_grid=[1, 2], **kwargs)
+            self.assertEqual(BFCLV4Module.time_budget_seconds(params), 47 * 3600)
 
 
     def test_total_budget_can_keep_an_earlier_eligible_point(self):

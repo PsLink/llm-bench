@@ -19,8 +19,16 @@ from app.schemas.benchmarks import SubmissionExtraParams
 from bench.modules.base import BenchmarkCancelled, BenchmarkTimeout, EndpointConfig
 
 
+def test_bfcl_scan_budget_is_below_actual_actor_limit():
+    from bench.modules.bfcl_v4 import BFCL_SCAN_MAX_SECONDS
+
+    assert BFCL_SCAN_MAX_SECONDS + 3600 <= jobs.run_submission.options["time_limit"] / 1000
+
+
 @pytest.mark.parametrize("retry", [False, True])
-@pytest.mark.parametrize("failure", [None, "timeout", "cancel", "late_cancel", "quality", "all"])
+@pytest.mark.parametrize("failure", [None, "timeout", "cancel", "late_cancel", "quality", "all",
+                                     "artifact_cancel", "scoring_cancel", "complete_cancel", "final_cancel",
+                                     "scan_rule_pass", "scan_rule_fail"])
 def test_worker_executes_and_freezes_the_submission_grid_without_point_fanout(
     tmp_path, monkeypatch, failure, retry,
 ):
@@ -36,6 +44,13 @@ def test_worker_executes_and_freezes_the_submission_grid_without_point_fanout(
         {"key": "total_tpm", "role": "score", "formula": "passthrough"},
         {"key": "admin_display", "role": "display"},
     ]
+    if failure in ("scan_rule_pass", "scan_rule_fail"):
+        frozen_configs.extend([
+            {"key": "sweep_complete", "role": "redline", "min_val": 1},
+            {"key": "sweep_canceled", "role": "redline", "max_val": 0},
+            {"key": "sweep_points_completed", "role": "redline",
+             "min_val": 6 if failure == "scan_rule_fail" else 5},
+        ])
     run = SimpleNamespace(id=42, module_name="bfcl_v4", params_json={
         "concurrency": 2, "request_timeout_seconds": 45},
         metric_configs_json=list(frozen_configs),
@@ -44,6 +59,7 @@ def test_worker_executes_and_freezes_the_submission_grid_without_point_fanout(
     session = MagicMock()
     session.get.return_value = Benchmark(id=1, config_hash="frozen")
     session.query.return_value.filter_by.return_value.first.return_value = run
+    session.query.return_value.filter_by.return_value.all.return_value = [run]
     if retry:
         # A previous attempt completed this module before the worker crashed.
         run.metric_configs_json.append({"key": "prior_attempt_only", "role": "display"})
@@ -78,18 +94,40 @@ def test_worker_executes_and_freezes_the_submission_grid_without_point_fanout(
     monkeypatch.setattr("bench.modules.bfcl_v4.run_process", runner)
     if failure == "late_cancel":
         refreshes = []
-        def refresh(row):
+        def refresh(row, **kwargs):
             refreshes.append(row)
             if len(refreshes) == 2:
                 submission.status = SubmissionStatus.CANCELED
         session.refresh.side_effect = refresh
+    if failure == "artifact_cancel":
+        monkeypatch.setattr(jobs, "_persist_bfcl_artifacts", lambda *args:
+                            setattr(submission, "status", SubmissionStatus.CANCELED))
+    if failure == "scoring_cancel":
+        evaluate = jobs.evaluate
+        def cancel_during_scoring(*args):
+            verdict = evaluate(*args)
+            submission.status = SubmissionStatus.CANCELED
+            return verdict
+        monkeypatch.setattr(jobs, "evaluate", cancel_during_scoring)
+    if failure == "complete_cancel":
+        complete = jobs._complete_run
+        def cancel_after_run_commit(*args, **kwargs):
+            complete(*args, **kwargs)
+            submission.status = SubmissionStatus.CANCELED
+        monkeypatch.setattr(jobs, "_complete_run", cancel_after_run_commit)
+    if failure == "final_cancel":
+        def refresh_at_finalization(row, **kwargs):
+            if run.status == ModuleRunStatus.DONE:
+                submission.status = SubmissionStatus.CANCELED
+        session.refresh.side_effect = refresh_at_finalization
     results = []
     jobs._run_module_loop(session, submission, [mod], EndpointConfig("http://localhost/v1", "m"),
                           results, str(tmp_path), threading.Event())
     assert seen == grid
     assert run.params_json["concurrency_grid"] == grid
     session.add.assert_not_called()
-    if failure in ("cancel", "late_cancel"):
+    if failure in ("cancel", "late_cancel", "artifact_cancel", "scoring_cancel",
+                   "complete_cancel", "final_cancel"):
         assert run.metrics_json["sweep_canceled"] == 1
         assert run.status == ModuleRunStatus.FAILED and not run.passed
         assert not submission.passed
@@ -101,7 +139,7 @@ def test_worker_executes_and_freezes_the_submission_grid_without_point_fanout(
     assert run.frozen_metric_configs_json == frozen_configs
     assert run.metric_configs_json[:len(frozen_configs)] == frozen_configs
     assert "prior_attempt_only" not in {c["key"] for c in run.metric_configs_json}
-    if failure in ("quality", "all"):
+    if failure in ("quality", "all", "scan_rule_fail"):
         assert not run.passed and not submission.passed
     else:
         assert run.metrics_json["reported_concurrency"] == 6
@@ -137,7 +175,8 @@ def test_retry_preserves_legacy_bfcl_snapshot_and_missing_config_fallback(config
         assert run.metric_configs_json == configs
 
 
-def test_submit_freezes_bfcl_rules_separately_from_display_snapshot(monkeypatch):
+@pytest.mark.parametrize("grid", [None, [1, 2]])
+def test_submit_freezes_bfcl_rules_separately_from_display_snapshot(monkeypatch, grid):
     import asyncio
     from datetime import datetime
     from unittest.mock import AsyncMock
@@ -164,12 +203,36 @@ def test_submit_freezes_bfcl_rules_separately_from_display_snapshot(monkeypatch)
     monkeypatch.setattr(submissions, "_reject_if_cordoned", AsyncMock())
     monkeypatch.setattr(submissions, "_enforce_submission_quota", AsyncMock())
     monkeypatch.setattr(jobs, "enqueue_submission", lambda *args: None)
-    body = SubmissionCreate(endpoint_url="http://localhost/v1", model="m")
+    body = SubmissionCreate(endpoint_url="http://localhost/v1", model="m",
+                            extra_params={"bfcl_concurrency_grid": grid} if grid else None)
     asyncio.run(submissions.submit_benchmark("bfcl", body, SimpleNamespace(id=1), session))
     run = next(row for row in added if isinstance(row, SubmissionRun))
     assert run.metric_configs_json == run.frozen_metric_configs_json == configs
     run.metric_configs_json.append({"key": "runtime_only", "role": "display"})
     assert run.frozen_metric_configs_json == configs[:1]
+
+
+def test_submit_rejects_implicit_scan_budget_above_actor_limit(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from fastapi import HTTPException
+
+    from app.api import submissions
+    from app.schemas.benchmarks import SubmissionCreate
+
+    monkeypatch.setattr(submissions, "_reject_if_cordoned", AsyncMock())
+    mod = SimpleNamespace(module_name="bfcl_v4", params_json={"max_seconds": 86400})
+    session = MagicMock()
+    session.execute = AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda:
+        SimpleNamespace(config_hash="frozen", modules=[mod])))
+    body = SubmissionCreate(endpoint_url="http://localhost/v1", model="m",
+                            extra_params={"bfcl_concurrency_grid": list(range(1, 17))})
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(submissions.submit_benchmark("bfcl", body, SimpleNamespace(id=1), session))
+    assert exc.value.status_code == 422
+    assert "47 hours" in exc.value.detail
+    session.add.assert_not_called()
 
 
 def test_changed_benchmark_is_rejected_before_running_queued_points(tmp_path):

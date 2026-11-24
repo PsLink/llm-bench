@@ -279,6 +279,18 @@ async def submit_benchmark(
         expected = body.extra_params.expected_benchmark_config_hash
         if expected and expected != benchmark.config_hash:
             raise HTTPException(409, "Benchmark changed after this BFCL scan was queued")
+        # Validate the effective grid before enqueueing: a valid per-point
+        # budget can exceed the actor limit once multiplied by the grid size.
+        from pydantic import ValidationError
+        from bench.modules.bfcl_v4 import BFCLV4Params
+        try:
+            BFCLV4Params(**{
+                **(benchmark.modules[0].params_json or {}),
+                "concurrency_grid": body.extra_params.bfcl_concurrency_grid,
+            })
+        except ValidationError as exc:
+            errors = "; ".join(err["msg"] for err in exc.errors())
+            raise HTTPException(422, f"Invalid BFCL scan params: {errors}") from exc
     await _enforce_submission_quota(user, session)
 
     user_id = user.id
@@ -453,7 +465,7 @@ async def cancel_submission(
 ):
     """Cancel a queued or running submission. Only the owner or an admin can cancel."""
     result = await session.execute(
-        select(Submission).where(Submission.id == submission_id)
+        select(Submission).where(Submission.id == submission_id).with_for_update()
     )
     submission = result.scalar_one_or_none()
     if submission is None:
@@ -475,6 +487,9 @@ async def cancel_submission(
     )
     submission.status = SubmissionStatus.CANCELED
     submission.finished_at = datetime.utcnow()
+    from app.core.cancellation import apply_cancellation
+    runs = await session.execute(select(SubmissionRun).where(SubmissionRun.submission_id == submission_id))
+    apply_cancellation(submission, runs.scalars().all())
     await session.commit()
     await session.refresh(submission)
     logger.info("Submission %d marked CANCELED", submission_id)

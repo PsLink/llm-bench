@@ -1412,6 +1412,15 @@ def _run_module_loop(
             else:
                 result.score, result.passed = evaluate(result.metrics, metric_configs)
 
+            # Serialize the verdict write with the cancel endpoint. Artifact
+            # persistence and evaluation happen before acquiring this short lock.
+            session.refresh(submission, with_for_update=True)
+            if (submission.status == SubmissionStatus.CANCELED and module_name == "bfcl_v4"
+                    and getattr(params, "concurrency_grid", None)):
+                from app.core.cancellation import canceled_scan_metrics
+                result.metrics = canceled_scan_metrics(result.metrics)
+                result.error = "BFCL scan canceled"
+                result.score, result.passed = 0.0, False
             _complete_run(session, run, result, metric_configs)
             logger.info(
                 "Submission %d module %s done — passed=%s score=%.4f",
@@ -1465,8 +1474,9 @@ def _run_module_loop(
         # finished — pinning which module killed the worker.
         checkpoint_worker_log(submission.id)
 
-    # Re-read status in case it was canceled while the worker was running
-    session.refresh(submission)
+    # This lock and the cancel endpoint's row lock make DONE vs CANCELED a
+    # serialized decision, including cancellation after the last run commit.
+    session.refresh(submission, with_for_update=True)
 
     # Aggregate scores (do this AFTER refresh so the values survive the commit)
     if results:
@@ -1503,8 +1513,25 @@ def _run_module_loop(
             submission.id, submission.passed, submission.score_total, len(results),
         )
     else:
+        from app.core.cancellation import apply_cancellation
+        canceled_runs = apply_cancellation(
+            submission, session.query(SubmissionRun).filter_by(submission_id=submission.id).all(),
+        )
+        for result in results:
+            if result is not _SKIPPED_RESULT:
+                result.passed = False
         logger.info("Submission %d worker exiting — already marked CANCELED", submission.id)
     session.commit()
+    if submission.status == SubmissionStatus.CANCELED:
+        # A scan may have emitted a passing event just before cancellation.
+        for canceled_run in canceled_runs:
+            _publish_run_event(submission.id, {
+                "event": "run_complete", "run_id": canceled_run.id,
+                "module_name": canceled_run.module_name, "status": "failed",
+                "score": 0.0, "passed": False, "metrics": canceled_run.metrics_json,
+                "metric_configs": canceled_run.metric_configs_json,
+                "error": canceled_run.error,
+            })
 
 
 def _fail_run(session, run, error: str) -> None:

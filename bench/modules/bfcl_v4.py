@@ -39,6 +39,15 @@ MANIFESTS = {
 # contiguous zero-based IDs and at least 200 official cases.
 MAX_TOOL_USE_CASES_PER_CATEGORY = 200
 
+# The platform actor has a 48-hour limit. Leave an hour for setup, artifact
+# persistence and teardown, including when the total budget is implicit.
+BFCL_SCAN_MAX_SECONDS = 47 * 3600
+BFCL_SCAN_METRIC_KEYS = frozenset({
+    "reported_concurrency", "sweep_complete", "sweep_canceled", "sweep_timed_out",
+    "sweep_points_attempted", "sweep_points_completed", "sweep_points_planned",
+    "sweep_stop_reason",
+})
+
 
 class BFCLV4Params(BaseModel):
     task_set: Literal[
@@ -55,7 +64,10 @@ class BFCLV4Params(BaseModel):
     concurrency: int = Field(2, ge=1, le=128)
     concurrency_grid: list[Annotated[int, Field(strict=True, ge=1, le=128)]] | None = Field(
         default=None, min_length=2, max_length=16)
-    max_total_seconds: float | None = Field(default=None, ge=1, le=1382400)
+    max_total_seconds: float | None = Field(
+        default=None, ge=1, le=BFCL_SCAN_MAX_SECONDS,
+        description="Scan budget in seconds; at most 47 hours including all concurrency points.",
+    )
     request_timeout_seconds: float = Field(120, ge=1, le=3600)
     max_seconds: float = Field(1800, ge=1, le=86400)
     request_retries: int = Field(0, ge=0, le=3)
@@ -78,6 +90,11 @@ class BFCLV4Params(BaseModel):
         if self.concurrency_grid is not None:
             if self.concurrency_grid != sorted(set(self.concurrency_grid)):
                 raise ValueError("concurrency_grid must be strictly increasing and unique")
+            budget = self.max_total_seconds or self.max_seconds * len(self.concurrency_grid)
+            if budget > BFCL_SCAN_MAX_SECONDS:
+                raise ValueError(
+                    "BFCL scan budget exceeds 47 hours; reduce max_seconds or set max_total_seconds"
+                )
         return self
 
 
@@ -218,6 +235,9 @@ class BFCLV4Module(TestModule):
         grid = params.concurrency_grid
         deadline = time.monotonic() + self.time_budget_seconds(params)
         configs = endpoint.run_context.get("metric_configs") or []
+        # Aggregate metrics do not exist on a child point. Their rules still
+        # participate in the protocol hash and the worker's final evaluation.
+        point_configs = [c for c in configs if c.get("key") not in BFCL_SCAN_METRIC_KEYS]
         levels = {}
         canceled = None
         stop_reason = ""
@@ -244,12 +264,12 @@ class BFCLV4Module(TestModule):
                         (i + fraction) / len(grid), f"c{c}: {message}"),
                     cancel_event,
                 )
-                required = ["total_tpm", *[c["key"] for c in configs
+                required = ["total_tpm", *[c["key"] for c in point_configs
                                          if c.get("role") in ("score", "redline")]]
                 valid = not child.error and all(
                     isinstance(child.metrics.get(k), (int, float))
                     and math.isfinite(child.metrics[k]) for k in required)
-                _, eligible = evaluate(child.metrics, configs)
+                _, eligible = evaluate(child.metrics, point_configs)
                 levels[f"c{concurrency}"] = {
                     **child.metrics, "valid": int(valid), "eligible": int(valid and eligible),
                     "case_concurrency": concurrency,
