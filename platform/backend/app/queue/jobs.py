@@ -188,6 +188,11 @@ def _make_progress_cb(submission_id: int, run_id: int, module_name: str, cancel_
         if cancel_event.is_set():
             raise SubmissionCancelled(f"Submission {submission_id} was canceled")
 
+    def checkpoint():
+        from app.queue.log_capture import checkpoint_worker_log
+        checkpoint_worker_log(submission_id)
+
+    cb.checkpoint = checkpoint
     return cb
 
 
@@ -1351,6 +1356,9 @@ def _run_module_loop(
             )
             if module_name == "bfcl_v4":
                 abort_event.bfcl_timeout_event = timed_out
+                logger.info("Submission %d BFCL run_id=%d artifacts_enabled=%s concurrency=%s grid=%s",
+                            submission.id, run.id, bool(settings.BFCL_ARTIFACT_DIR),
+                            params.concurrency, params.concurrency_grid)
             progress_cb = _make_progress_cb(submission.id, run.id, module_name, abort_event)
             # Close out any transaction the setup above opened (params, the
             # concurrency override, the run row) BEFORE handing control to a module
@@ -1407,6 +1415,8 @@ def _run_module_loop(
                         break
                 _persist_bfcl_artifacts(result, submission.id, run.id)
             if result.error:
+                logger.error("Submission %d module %s run_id=%d returned error: %s",
+                             submission.id, module_name, run.id, result.error)
                 result.score = 0.0
                 result.passed = False
             else:
