@@ -73,7 +73,11 @@ class BFCLV4Params(BaseModel):
         1,
         ge=1,
         le=MAX_TOOL_USE_CASES_PER_CATEGORY,
-        description="Number of cases per category for tool-use and multi-turn-long-context task sets, selected by ascending case ID.",
+        description="Number of cases per category for tool-use and multi-turn-long-context task sets.",
+    )
+    case_selection: Literal["head", "tail"] = Field(
+        "head",
+        description="Use the original leading case IDs (head), or take the last cases in pinned dataset order (tail).",
     )
     concurrency: int = Field(2, ge=1, le=128)
     concurrency_grid: list[Annotated[int, Field(strict=True, ge=1, le=128)]] | None = Field(
@@ -282,6 +286,7 @@ class BFCLV4Module(TestModule):
         timed_out = False
         active_concurrency = None
         point_states = {}
+        selection = {"selected_cases": {}} if params.case_selection == "tail" else {}
 
         def checkpoint_scan(status):
             snapshot = {"status": status, "concurrency_grid": grid,
@@ -315,6 +320,7 @@ class BFCLV4Module(TestModule):
                 point_progress.checkpoint = lambda: _checkpoint(progress_cb)
                 child = self._run_single(
                     endpoint, point, str(root / f"c{concurrency}"), point_progress, cancel_event,
+                    **selection,
                 )
                 required = ["total_tpm", *[c["key"] for c in point_configs
                                          if c.get("role") in ("score", "redline")]]
@@ -394,6 +400,8 @@ class BFCLV4Module(TestModule):
             checkpoint_scan("canceled" if canceled else "timed_out" if timed_out else
                             "completed" if complete else "partial_failure")
             protocol = {"params": params.model_dump(exclude_none=True), "redlines": configs}
+            if params.case_selection == "head":
+                protocol["params"].pop("case_selection")
             _write_json(root / "scan.json", {
                 "protocol_hash": hashlib.sha256(json.dumps(
                     protocol, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
@@ -417,6 +425,8 @@ class BFCLV4Module(TestModule):
         output_dir,
         progress_cb=_noop_progress,
         cancel_event=None,
+        *,
+        selected_cases: dict[str, list[str]] | None = None,
     ):
         started = time.monotonic()
         deadline = started + params.max_seconds
@@ -425,6 +435,7 @@ class BFCLV4Module(TestModule):
         root.mkdir(parents=True, exist_ok=False)
         index = root / "artifacts.json"
         config_path = root / "config.json"
+        selection_path = root / "case-selection.json"
         probe_root = root / "probe"
         probe_config_path = probe_root / "config.json"
         result = ModuleResult(artifacts=[str(index)])
@@ -450,7 +461,30 @@ class BFCLV4Module(TestModule):
             if url.scheme not in ("http", "https") or not url.hostname:
                 raise ValueError("BFCL requires an HTTP(S) endpoint")
             manifest = json.loads(MANIFESTS[params.task_set].read_text())
-            if params.cases_per_category > 1:
+            python = os.environ.get("BFCL_PYTHON", "/opt/bfcl/bin/python")
+            if "/" in python and not os.access(python, os.X_OK):
+                raise RuntimeError(
+                    "BFCL runner environment unavailable. Use a Linux AMD64 BFCL worker or set BFCL_PYTHON."
+                )
+            if params.case_selection == "tail":
+                if selected_cases is None:
+                    selected_cases = {}
+                if not selected_cases:
+                    phase = "select"
+                    _write_json(selection_path, {
+                        "revision": manifest["revision"],
+                        "categories": list(manifest["cases"]),
+                        "count": params.cases_per_category,
+                    })
+                    run_process(
+                        [python, "-m", "bench.bfcl.runner", "--phase", phase,
+                         "--root", str(root.resolve())],
+                        env=os.environ.copy(), deadline=deadline, cancel_event=cancel_event,
+                    )
+                    selected_cases.update(json.loads(selection_path.read_text()))
+                    phase = "setup"
+                manifest["cases"] = selected_cases
+            elif params.cases_per_category > 1:
                 manifest["cases"] = {
                     category: [
                         f"{category}_{index}"
@@ -500,11 +534,6 @@ class BFCLV4Module(TestModule):
                 "BFCL_ENDPOINT_API_KEY": endpoint.api_key,
                 "BFCL_PROJECT_ROOT": str(root.resolve()),
             }
-            python = os.environ.get("BFCL_PYTHON", "/opt/bfcl/bin/python")
-            if "/" in python and not os.access(python, os.X_OK):
-                raise RuntimeError(
-                    "BFCL runner environment unavailable. Use a Linux AMD64 BFCL worker or set BFCL_PYTHON."
-                )
             phases = [("generate", 0.1, root), ("evaluate", 0.75, root)]
             if params.probe_endpoint:
                 probe_root.mkdir()
@@ -611,6 +640,7 @@ class BFCLV4Module(TestModule):
             _checkpoint(progress_cb)
             config_path.unlink(missing_ok=True)
             probe_config_path.unlink(missing_ok=True)
+            selection_path.unlink(missing_ok=True)
             _write_json(
                 index,
                 {
