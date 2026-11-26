@@ -82,14 +82,26 @@ The module defaults to the smoke task set, `cases_per_category: 1`, and
 
 | `task_set` | Categories | Measured cases |
 | --- | --- | --- |
-| `bfcl-v4-smoke-v1` | `simple_python`, `multi_turn_base` | Two fixed cases; `cases_per_category` must be 1 |
+| `bfcl-v4-smoke-v1` | `simple_python`, `multi_turn_base` | Two fixed cases; `cases_per_category` must be 1 and `case_selection` must be `head` |
 | `bfcl-v4-tool-use-v1` | `simple_python`, `multiple`, `parallel`, `irrelevance`, `multi_turn_base` | `5 × cases_per_category` |
 | `bfcl-v4-multi-turn-long-context-v1` | `multi_turn_long_context` | `cases_per_category` |
 
-The tool-use and long-context sets accept 1–200 cases per category. They select
-the contiguous IDs `<category>_0` through `<category>_<N-1>` from the pinned
-revision. The resolved IDs are written to each attempt's `manifest.json` and
-participate in its `protocol_hash`.
+The tool-use and long-context sets accept 1–200 cases per category and support
+`case_selection: head` (the default) or `case_selection: tail`. Head selects the
+contiguous IDs `<category>_0` through `<category>_<N-1>`. Tail selects the last N
+records in each category's pinned BFCL dataset file, preserving the original
+dataset order rather than sorting IDs. Smoke rejects tail to preserve its fixed
+cases.
+
+For tail, a separate `select` runner phase checks the installed BFCL revision and
+resolves the IDs before generation. A concurrency scan resolves the selection
+once successfully and reuses the same IDs across all subsequent points. Selection
+time counts toward the attempt and scan budgets; failures, timeouts and
+cancellation retain the select phase's available runner diagnostics.
+
+The resolved IDs are written to each attempt's `manifest.json` and participate
+in its `protocol_hash`. Default head selection preserves the existing scan
+protocol hash; tail selection participates in the scan protocol hash explicitly.
 
 Importable benchmark examples are available for
 [tool use](../../benchmarks/bfcl-v4-tool-use-v1.yaml) and

@@ -101,6 +101,8 @@ class BFCLV4Params(BaseModel):
 
     @model_validator(mode="after")
     def validate_case_count(self):
+        if self.task_set == "bfcl-v4-smoke-v1" and self.case_selection != "head":
+            raise ValueError("bfcl-v4-smoke-v1 has fixed cases; case_selection must be head")
         if self.task_set == "bfcl-v4-smoke-v1" and self.cases_per_category != 1:
             raise ValueError(
                 "bfcl-v4-smoke-v1 has a fixed case count; use bfcl-v4-tool-use-v1 to select more"
@@ -476,11 +478,14 @@ class BFCLV4Module(TestModule):
                         "categories": list(manifest["cases"]),
                         "count": params.cases_per_category,
                     })
+                    save_state(root / "state.json", {**context, "status": status, "phase": phase})
+                    runner_active = True
                     run_process(
                         [python, "-m", "bench.bfcl.runner", "--phase", phase,
                          "--root", str(root.resolve())],
                         env=os.environ.copy(), deadline=deadline, cancel_event=cancel_event,
                     )
+                    runner_active = False
                     selected_cases.update(json.loads(selection_path.read_text()))
                     phase = "setup"
                 manifest["cases"] = selected_cases

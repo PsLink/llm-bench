@@ -281,3 +281,52 @@ def test_bad_runner_states_do_not_replace_original_failure(tmp_path, monkeypatch
     snapshot = result.metrics["diagnostic"]
     assert snapshot["runner_state"] == {"code": "diagnostic_unreadable"}
     assert snapshot["process_state"] == {"code": "diagnostic_unreadable"}
+
+
+@pytest.mark.parametrize("grid", [None, [1, 2]])
+@pytest.mark.parametrize("failure,status", [(RuntimeError("child failed"), "failed"),
+                                           (BenchmarkTimeout("budget"), "timed_out"),
+                                           (BenchmarkCancelled("cancel"), "canceled")])
+def test_tail_selection_failure_preserves_runner_diagnostics(tmp_path, monkeypatch, grid, failure, status):
+    monkeypatch.setenv("BFCL_PYTHON", sys.executable)
+
+    def process(command, **kwargs):
+        assert command[-3] == "select"
+        root = Path(command[-1])
+        (root / "runner_state.json").write_text('{"phase":"select","stage":"setup"}')
+        (root / "process_state.json").write_text('{"phase":"select","pid":123,"exit_code":-15}')
+        if status == "failed":
+            (root / "runner_error.json").write_text(json.dumps({
+                "phase": "select", "type": "DiagnosticError", "code": "installed_revision_mismatch",
+            }))
+        raise failure
+
+    params = BFCLV4Params(task_set="bfcl-v4-multi-turn-long-context-v1", case_selection="tail",
+                          concurrency_grid=grid)
+    with patch("bench.modules.bfcl_v4.run_process", side_effect=process):
+        try:
+            result = BFCLV4Module().run(EndpointConfig("http://localhost/v1", "m"), params, tmp_path)
+        except BenchmarkCancelled as exc:
+            result = exc.partial_result
+    snapshot = (result.metrics["c1"] if grid else result.metrics)["diagnostic"]
+    assert snapshot["status"] == status
+    assert snapshot["phase"] == "select"
+    assert snapshot["runner_state"]["stage"] == "setup"
+    assert snapshot["process_state"]["exit_code"] == -15
+    assert snapshot["process_state"]["pid"] == 123
+    assert snapshot["diagnostic"]["code"] == (
+        "installed_revision_mismatch" if status == "failed" else "diagnostic_missing")
+
+
+def test_invalid_selection_output_is_a_parent_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("BFCL_PYTHON", sys.executable)
+
+    def process(command, **kwargs):
+        assert command[-3] == "select"
+        (Path(command[-1]) / "case-selection.json").write_text('{"unfinished":')
+
+    with patch("bench.modules.bfcl_v4.run_process", side_effect=process):
+        result = BFCLV4Module().run(EndpointConfig("http://localhost/v1", "m"), BFCLV4Params(
+            task_set="bfcl-v4-multi-turn-long-context-v1", case_selection="tail"), tmp_path)
+    assert result.metrics["diagnostic"]["diagnostic"]["code"] == "parent_failure"
+    assert result.metrics["diagnostic"]["diagnostic"]["type"] == "JSONDecodeError"

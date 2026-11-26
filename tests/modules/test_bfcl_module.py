@@ -137,6 +137,16 @@ class BFCLModuleTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "smoke"):
             BFCLV4Params(task_set="bfcl-v4-smoke-v1", cases_per_category=2)
 
+    def test_smoke_rejects_tail_selection(self):
+        from pydantic import ValidationError
+
+        with self.assertRaisesRegex(ValidationError, "smoke.*head"):
+            BFCLV4Params(case_selection="tail")
+        self.assertEqual(BFCLV4Params().case_selection, "head")
+        for task_set in ("bfcl-v4-tool-use-v1", "bfcl-v4-multi-turn-long-context-v1"):
+            with self.subTest(task_set=task_set):
+                self.assertEqual(BFCLV4Params(task_set=task_set, case_selection="tail").case_selection, "tail")
+
     def test_long_context_task_set_runs_only_selected_cases(self):
         hashes = set()
         for count in (1, 2, 200):
