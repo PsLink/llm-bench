@@ -9,11 +9,58 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from bench.bfcl.runner import REVISION, run_phase
+
 from bench.modules.base import BenchmarkCancelled, BenchmarkTimeout, EndpointConfig, ModuleResult
 from bench.modules.bfcl_v4 import BFCLV4Module, BFCLV4Params
 
 
 class BFCLGridTest(unittest.TestCase):
+    def test_tail_uses_dataset_order_and_reuses_the_selection_across_points(self):
+        selected = []
+        selections = []
+        category = "multi_turn_long_context"
+        case_ids = [f"{category}_{i}" for i in (100, 8, 42, 17)]
+
+        def process(command, **kwargs):
+            phase, root = command[-3], Path(command[-1])
+            if phase == "select":
+                selections.append(root)
+                run_phase(phase, root)
+            elif phase == "generate":
+                manifest = json.loads((root / "manifest.json").read_text())
+                selected.append(manifest["cases"][category])
+            elif phase == "evaluate":
+                (root / "summary.json").write_text(json.dumps({
+                    "metrics": {"accuracy": 1.0, "total_tpm": 1000},
+                }))
+
+        with tempfile.TemporaryDirectory() as output:
+            package = Path(output) / "bfcl_eval"
+            data = package / "data"
+            data.mkdir(parents=True)
+            (data / f"BFCL_v4_{category}.json").write_text(
+                "".join(json.dumps({"id": case_id}) + "\n" for case_id in case_ids)
+            )
+            with patch.dict(os.environ, {"BFCL_PYTHON": sys.executable}), patch(
+                "bench.modules.bfcl_v4.run_process", side_effect=process
+            ), patch("bench.bfcl.runner.installed_revision", return_value=REVISION), patch(
+                "bench.bfcl.runner.find_spec"
+            ) as spec:
+                spec.return_value.origin = str(package / "__init__.py")
+                for selection, expected in (("head", [f"{category}_0", f"{category}_1"]),
+                                            ("tail", case_ids[-2:])):
+                    params = BFCLV4Params(
+                        task_set="bfcl-v4-multi-turn-long-context-v1",
+                        cases_per_category=2, case_selection=selection, concurrency_grid=[1, 2],
+                    )
+                    result = BFCLV4Module().run(
+                        EndpointConfig("http://localhost/v1", "model"), params, output,
+                    )
+                    self.assertIsNone(result.error)
+                    self.assertEqual(selected[-2:], [expected, expected])
+                self.assertEqual(len(selections), 1)
+
     def execute(self, points, *, bad=None, cancel=None, missing=None, timeout=False,
                 failure_type=RuntimeError, accuracy=None, configs=None, point_metrics=None):
         seen = []
