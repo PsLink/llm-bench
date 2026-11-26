@@ -5,7 +5,6 @@ import contextvars
 import json
 import os
 import time
-from importlib.util import find_spec
 from pathlib import Path
 
 from bench.bfcl.diagnostics import DiagnosticError, exception_details, save_state
@@ -236,38 +235,11 @@ def handler_class(base, config, root, *, phase="generate"):
     return StreamingHandler
 
 
-def select_tail_cases(root):
-    path = root / "case-selection.json"
-    selection = json.loads(path.read_text())
-    if selection["revision"] != REVISION or installed_revision() != REVISION:
-        raise DiagnosticError("Install the pinned BFCL Git revision", "installed_revision_mismatch")
-
-    spec = find_spec("bfcl_eval")
-    if spec is None or spec.origin is None:
-        raise DiagnosticError("Pinned BFCL dataset is unavailable", "dataset_unavailable")
-    data = Path(spec.origin).parent / "data"
-    count = selection["count"]
-    cases = {}
-    for category in selection["categories"]:
-        with (data / f"BFCL_v4_{category}.json").open(encoding="utf-8") as dataset:
-            ids = [json.loads(line)["id"] for line in dataset if line.strip()]
-        if len(ids) < count:
-            raise DiagnosticError(
-                f"BFCL category {category} has {len(ids)} cases, requested {count}",
-                "insufficient_cases", category=category,
-            )
-        cases[category] = ids[-count:]
-    path.write_text(json.dumps(cases), encoding="utf-8")
-
-
 def run_phase(phase, root):
     def stage(name):
         save_state(root / "runner_state.json", {"phase": phase, "stage": name})
 
     stage("setup")
-    if phase == "select":
-        select_tail_cases(root)
-        return
     config = json.loads((root / "config.json").read_text())
     manifest = config["manifest"]
     if manifest["revision"] != REVISION:
@@ -419,7 +391,7 @@ def run_phase(phase, root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--phase", choices=["select", "probe", "generate", "evaluate"], required=True
+        "--phase", choices=["probe", "generate", "evaluate"], required=True
     )
     parser.add_argument("--root", type=Path, required=True)
     args = parser.parse_args()

@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
 
-from bench.bfcl.diagnostics import EventSummary, read_error, save_state
+from bench.bfcl.diagnostics import EventSummary, exception_details, read_error, read_runner_state, save_state
 from bench.modules.base import (
     BenchmarkCancelled,
     BenchmarkTimeout,
@@ -73,11 +73,7 @@ class BFCLV4Params(BaseModel):
         1,
         ge=1,
         le=MAX_TOOL_USE_CASES_PER_CATEGORY,
-        description="Number of cases per category for tool-use and multi-turn-long-context task sets.",
-    )
-    case_selection: Literal["head", "tail"] = Field(
-        "head",
-        description="Use the original leading case IDs (head), or take the last cases in pinned dataset order (tail).",
+        description="Number of cases per category for tool-use and multi-turn-long-context task sets, selected by ascending case ID.",
     )
     concurrency: int = Field(2, ge=1, le=128)
     concurrency_grid: list[Annotated[int, Field(strict=True, ge=1, le=128)]] | None = Field(
@@ -126,6 +122,11 @@ def run_process(command, *, env, deadline, cancel_event):
             raise BenchmarkTimeout("BFCL exceeded its total wall-clock budget")
 
     check()
+    phase = command[command.index("--phase") + 1] if "--phase" in command else "unknown"
+    root = Path(command[command.index("--root") + 1]) if "--root" in command else None
+    summary = EventSummary(root) if root else None
+    started = time.monotonic()
+    next_heartbeat = started + 30
     # Upstream may print prompts and credentials in exceptions. Only our typed
     # failure and sanitized event files are published, never raw child output.
     process = subprocess.Popen(
@@ -135,13 +136,8 @@ def run_process(command, *, env, deadline, cancel_event):
         stdout=subprocess.DEVNULL,
         stderr=None if env.get("BFCL_LOCAL_DEBUG") == "1" else subprocess.DEVNULL,
     )
-    phase = command[command.index("--phase") + 1] if "--phase" in command else "unknown"
-    root = Path(command[-1]) if "--root" in command else None
-    summary = EventSummary(root) if root else None
-    started = time.monotonic()
-    next_heartbeat = started + 30
-    logger.info("BFCL runner started phase=%s pid=%s", phase, process.pid)
     try:
+        logger.info("BFCL runner started phase=%s pid=%s", phase, process.pid)
         while process.poll() is None:
             check()
             now = time.monotonic()
@@ -157,19 +153,25 @@ def run_process(command, *, env, deadline, cancel_event):
             )
     finally:
         if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 process.wait()
-        logger.info("BFCL runner exited phase=%s pid=%s exit_code=%s elapsed_seconds=%.1f",
-                    phase, process.pid, process.returncode, time.monotonic() - started)
         if root is not None:
             save_state(root / "process_state.json", {
                 "phase": phase, "pid": process.pid, "exit_code": process.returncode,
                 "elapsed_seconds": round(time.monotonic() - started, 3),
             })
+        logger.info("BFCL runner exited phase=%s pid=%s exit_code=%s elapsed_seconds=%.1f",
+                    phase, process.pid, process.returncode, time.monotonic() - started)
 
 
 def _write_json(path, value):
@@ -280,13 +282,14 @@ class BFCLV4Module(TestModule):
         timed_out = False
         active_concurrency = None
         point_states = {}
-        selection = {"selected_cases": {}} if params.case_selection == "tail" else {}
 
         def checkpoint_scan(status):
             snapshot = {"status": status, "concurrency_grid": grid,
                         "active_concurrency": active_concurrency, "points": point_states}
             save_state(root / "scan_state.json", snapshot)
-            logger.info("BFCL scan checkpoint %s", json.dumps(snapshot))
+            compact = {name: {k: point[k] for k in ("status", "valid", "eligible", "error") if k in point}
+                       for name, point in point_states.items()}
+            logger.info("BFCL scan checkpoint %s", json.dumps({**snapshot, "points": compact}))
             _checkpoint(progress_cb)
 
         checkpoint_scan("running")
@@ -312,7 +315,6 @@ class BFCLV4Module(TestModule):
                 point_progress.checkpoint = lambda: _checkpoint(progress_cb)
                 child = self._run_single(
                     endpoint, point, str(root / f"c{concurrency}"), point_progress, cancel_event,
-                    **selection,
                 )
                 required = ["total_tpm", *[c["key"] for c in point_configs
                                          if c.get("role") in ("score", "redline")]]
@@ -392,8 +394,6 @@ class BFCLV4Module(TestModule):
             checkpoint_scan("canceled" if canceled else "timed_out" if timed_out else
                             "completed" if complete else "partial_failure")
             protocol = {"params": params.model_dump(exclude_none=True), "redlines": configs}
-            if params.case_selection == "head":
-                protocol["params"].pop("case_selection")
             _write_json(root / "scan.json", {
                 "protocol_hash": hashlib.sha256(json.dumps(
                     protocol, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
@@ -417,8 +417,6 @@ class BFCLV4Module(TestModule):
         output_dir,
         progress_cb=_noop_progress,
         cancel_event=None,
-        *,
-        selected_cases: dict[str, list[str]] | None = None,
     ):
         started = time.monotonic()
         deadline = started + params.max_seconds
@@ -427,7 +425,6 @@ class BFCLV4Module(TestModule):
         root.mkdir(parents=True, exist_ok=False)
         index = root / "artifacts.json"
         config_path = root / "config.json"
-        selection_path = root / "case-selection.json"
         probe_root = root / "probe"
         probe_config_path = probe_root / "config.json"
         result = ModuleResult(artifacts=[str(index)])
@@ -435,6 +432,8 @@ class BFCLV4Module(TestModule):
         phase = "setup"
         phase_root = root
         status = "running"
+        runner_active = False
+        parent_error = None
         identity = {k: v for k, v in getattr(endpoint, "run_context", {}).items()
                     if k in {"submission_id", "module_run_id"}}
         context = {**identity, "attempt_id": attempt, "concurrency": params.concurrency,
@@ -451,30 +450,7 @@ class BFCLV4Module(TestModule):
             if url.scheme not in ("http", "https") or not url.hostname:
                 raise ValueError("BFCL requires an HTTP(S) endpoint")
             manifest = json.loads(MANIFESTS[params.task_set].read_text())
-            python = os.environ.get("BFCL_PYTHON", "/opt/bfcl/bin/python")
-            if "/" in python and not os.access(python, os.X_OK):
-                raise RuntimeError(
-                    "BFCL runner environment unavailable. Use a Linux AMD64 BFCL worker or set BFCL_PYTHON."
-                )
-            if params.case_selection == "tail":
-                if selected_cases is None:
-                    selected_cases = {}
-                if not selected_cases:
-                    phase = "select"
-                    _write_json(selection_path, {
-                        "revision": manifest["revision"],
-                        "categories": list(manifest["cases"]),
-                        "count": params.cases_per_category,
-                    })
-                    run_process(
-                        [python, "-m", "bench.bfcl.runner", "--phase", phase,
-                         "--root", str(root.resolve())],
-                        env=os.environ.copy(), deadline=deadline, cancel_event=cancel_event,
-                    )
-                    selected_cases.update(json.loads(selection_path.read_text()))
-                    phase = "setup"
-                manifest["cases"] = selected_cases
-            elif params.cases_per_category > 1:
+            if params.cases_per_category > 1:
                 manifest["cases"] = {
                     category: [
                         f"{category}_{index}"
@@ -524,6 +500,11 @@ class BFCLV4Module(TestModule):
                 "BFCL_ENDPOINT_API_KEY": endpoint.api_key,
                 "BFCL_PROJECT_ROOT": str(root.resolve()),
             }
+            python = os.environ.get("BFCL_PYTHON", "/opt/bfcl/bin/python")
+            if "/" in python and not os.access(python, os.X_OK):
+                raise RuntimeError(
+                    "BFCL runner environment unavailable. Use a Linux AMD64 BFCL worker or set BFCL_PYTHON."
+                )
             phases = [("generate", 0.1, root), ("evaluate", 0.75, root)]
             if params.probe_endpoint:
                 probe_root.mkdir()
@@ -549,6 +530,7 @@ class BFCLV4Module(TestModule):
                 logger.info("BFCL phase started context=%s phase=%s", json.dumps(context), phase)
                 phase_started = time.monotonic()
                 progress_cb(fraction, f"BFCL {phase}")
+                runner_active = True
                 run_process(
                     [
                         python,
@@ -563,6 +545,7 @@ class BFCLV4Module(TestModule):
                     deadline=deadline,
                     cancel_event=cancel_event,
                 )
+                runner_active = False
                 logger.info("BFCL phase completed context=%s phase=%s elapsed_seconds=%.1f requests=%s",
                             json.dumps(context), phase, time.monotonic() - phase_started,
                             json.dumps(EventSummary(phase_root).poll()))
@@ -587,10 +570,12 @@ class BFCLV4Module(TestModule):
             status = "completed"
         except BenchmarkCancelled as exc:
             canceled = exc
+            parent_error = exception_details(exc)
             result.error = "BFCL canceled"
             timeout_event = getattr(cancel_event, "bfcl_timeout_event", None)
             status = "timed_out" if timeout_event is not None and timeout_event.is_set() else "canceled"
         except Exception as exc:
+            parent_error = exception_details(exc)
             status = "timed_out" if isinstance(exc, BenchmarkTimeout) else "failed"
             # Do not persist arbitrary upstream messages (may include the key).
             result.error = (
@@ -598,17 +583,27 @@ class BFCLV4Module(TestModule):
                 if isinstance(exc, (ValueError, BenchmarkTimeout, RuntimeError))
                 else f"BFCL {type(exc).__name__}"
             )
-            diagnostic = read_error(phase_root)
-            if "type" in diagnostic:
-                result.error += f" ({diagnostic.get('phase', phase)}: {diagnostic['type']})"
-            if endpoint.api_key:
-                result.error = result.error.replace(endpoint.api_key, "[REDACTED]")
         finally:
+            diagnostic = None
+            if result.error:
+                if runner_active:
+                    diagnostic = read_error(phase_root)
+                    if diagnostic.get("phase", phase) != phase:
+                        diagnostic = {"code": "diagnostic_stale"}
+                    if "type" in diagnostic:
+                        result.error += f" ({diagnostic.get('phase', phase)}: {diagnostic['type']})"
+                else:
+                    diagnostic = {**(parent_error or {}), "code": "parent_failure", "phase": phase}
+                if endpoint.api_key:
+                    result.error = result.error.replace(endpoint.api_key, "[REDACTED]")
             snapshot = {**context, "status": status, "phase": phase,
                         "elapsed_seconds": round(time.monotonic() - started, 3),
                         "requests": EventSummary(phase_root).poll(), "error": result.error}
             if result.error:
-                snapshot["diagnostic"] = read_error(phase_root)
+                snapshot["diagnostic"] = diagnostic
+                if runner_active:
+                    snapshot["runner_state"] = read_runner_state(phase_root, "runner_state.json", phase)
+                    snapshot["process_state"] = read_runner_state(phase_root, "process_state.json", phase)
                 result.metrics["diagnostic"] = snapshot
             save_state(root / "state.json", snapshot)
             logger.log(logging.ERROR if result.error else logging.INFO,
@@ -616,7 +611,6 @@ class BFCLV4Module(TestModule):
             _checkpoint(progress_cb)
             config_path.unlink(missing_ok=True)
             probe_config_path.unlink(missing_ok=True)
-            selection_path.unlink(missing_ok=True)
             _write_json(
                 index,
                 {
