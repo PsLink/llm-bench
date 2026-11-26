@@ -91,6 +91,11 @@ the contiguous IDs `<category>_0` through `<category>_<N-1>` from the pinned
 revision. The resolved IDs are written to each attempt's `manifest.json` and
 participate in its `protocol_hash`.
 
+`allow_request_failures` defaults to false. When enabled, cases interrupted by
+recorded HTTP or transport failures are scored as incorrect in the full case set.
+Uptime includes all generation HTTP attempts, including failed retries. Use an
+`uptime` redline to set the required success rate for a benchmark.
+
 Importable benchmark examples are available for
 [tool use](../../benchmarks/bfcl-v4-tool-use-v1.yaml) and
 [long-context multi-turn](../../benchmarks/bfcl-v4-multi-turn-long-context-v1.yaml).

@@ -11,15 +11,18 @@ from threading import Barrier, Thread
 
 from bench.modules.base import EndpointConfig
 from bench.modules.bfcl_v4 import BFCLV4Module, BFCLV4Params
+from bench.modules.evaluator import check_redlines
 
 
 def main():
     rendezvous = Barrier(2, timeout=10)
     synchronize_cases = True
+    fail_multi_turn = False
     seen_tool_ids = []  # Appends happen before the runner completes.
 
     class Fixture(BaseHTTPRequestHandler):
         def do_POST(self):
+            nonlocal fail_multi_turn
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             assert self.path == "/v1/chat/completions"
             assert body["model"] == "fixture-model"
@@ -28,6 +31,10 @@ def main():
             tool_names = {tool["function"]["name"] for tool in body.get("tools", [])}
             triangle = "calculate_triangle_area" in tool_names
             multi_turn = "pwd" in tool_names
+            if fail_multi_turn and multi_turn:
+                fail_multi_turn = False
+                self.send_error(503)
+                return
             if synchronize_cases and (triangle or (multi_turn and len(messages) == 1)):
                 rendezvous.wait()
             if triangle:
@@ -239,8 +246,33 @@ def main():
             ]
             assert all(event["phase"] == "generate" for event in official)
             assert expanded.metrics["http_attempt_count"] == len(official)
+            fail_multi_turn = True
+            partial = BFCLV4Module().run(
+                EndpointConfig(endpoint, "fixture-model", "fixture-key"),
+                BFCLV4Params(
+                    allow_request_failures=True, min_ttft_coverage=1, min_usage_coverage=1
+                ),
+                directory,
+            )
+            assert not partial.error, partial.error
+            assert not fail_multi_turn
+            assert partial.metrics["case_count"] == 2
+            assert partial.metrics["accuracy"] == 0.5
+            assert partial.metrics["total_tpm"] > 0
+            assert partial.metrics["uptime"] == 0.5
+            assert not check_redlines(
+                partial.metrics, [{"key": "uptime", "role": "redline", "min_val": 0.99}]
+            )
+            partial_attempt = Path(partial.artifacts[0]).parent
+            failed_cases = [
+                row for row in map(
+                    json.loads, (partial_attempt / "case_results.jsonl").read_text().splitlines()
+                ) if row.get("request_failed")
+            ]
+            assert [row["case_id"] for row in failed_cases] == ["multi_turn_base_0"]
+            assert failed_cases[0]["success"] is False
             print(
-                "Official BFCL streaming and non-streaming scores agree, and all five tool-use categories score"
+                "Official BFCL streaming and non-streaming scores agree, and request failures count as incorrect"
             )
         finally:
             server.shutdown()

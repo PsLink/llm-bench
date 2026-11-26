@@ -85,6 +85,9 @@ class BFCLV4Params(BaseModel):
     request_timeout_seconds: float = Field(120, ge=1, le=3600)
     max_seconds: float = Field(1800, ge=1, le=86400)
     request_retries: int = Field(0, ge=0, le=3)
+    allow_request_failures: bool = Field(
+        False, description="Score cases interrupted by HTTP request failures as incorrect."
+    )
     export_replay_trace: bool = False
     probe_endpoint: bool = Field(
         False,
@@ -185,6 +188,7 @@ class BFCLV4Module(TestModule):
     display_name = "BFCL V4 subset"
     description = "Official BFCL frozen subset: tool-use quality and streaming performance. Not the full leaderboard."
     ParamsSchema = BFCLV4Params
+    card_norm_baseline = 8
     metrics_descriptors = [
         MetricDescriptor(name, name.replace("_", " "), unit, higher_is_better=higher)
         for name, unit, higher in [
@@ -202,6 +206,7 @@ class BFCLV4Module(TestModule):
             ("accuracy_multiple", "", True),
             ("accuracy_parallel", "", True),
             ("accuracy_irrelevance", "", True),
+            ("ttft_mean_ms", "ms", False),
             ("ttft_p50_ms", "ms", False),
             ("ttft_p90_ms", "ms", False),
             ("ttft_p99_ms", "ms", False),
@@ -241,6 +246,14 @@ class BFCLV4Module(TestModule):
             ("output_usage_coverage", "", True),
             ("cache_usage_coverage", "", True),
         ]
+    ] + [
+        MetricDescriptor(
+            "request_output_tps", "Per-request Output TPS", "tok/s",
+            "Mean of completion tokens divided by end-to-end latency across successful requests.",
+        ),
+        MetricDescriptor(
+            "uptime", "Uptime", "%", "Fraction of successful generation HTTP attempts.",
+        ),
     ]
 
     default_metric_configs = [
@@ -393,7 +406,10 @@ class BFCLV4Module(TestModule):
             ]
             checkpoint_scan("canceled" if canceled else "timed_out" if timed_out else
                             "completed" if complete else "partial_failure")
-            protocol = {"params": params.model_dump(exclude_none=True), "redlines": configs}
+            protocol_params = params.model_dump(exclude_none=True)
+            if not params.allow_request_failures:
+                protocol_params.pop("allow_request_failures")
+            protocol = {"params": protocol_params, "redlines": configs}
             _write_json(root / "scan.json", {
                 "protocol_hash": hashlib.sha256(json.dumps(
                     protocol, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
@@ -475,6 +491,8 @@ class BFCLV4Module(TestModule):
             )
             if params.probe_endpoint:
                 manifest["probe"] = {"case_id": "multi_turn_base_0", "concurrency": 1}
+            if params.allow_request_failures:
+                manifest["allow_request_failures"] = True
             protocol = json.dumps(
                 manifest, sort_keys=True, separators=(",", ":")
             ).encode()
