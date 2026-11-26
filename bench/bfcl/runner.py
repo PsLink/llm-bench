@@ -7,6 +7,7 @@ import os
 import time
 from pathlib import Path
 
+from bench.bfcl.diagnostics import DiagnosticError, exception_details, save_state
 from bench.bfcl.smoke import category_output, check_generated_cases, installed_revision
 from bench.bfcl.streaming import assemble_stream
 from bench.bfcl.telemetry import EventWriter, aggregate_metrics, peak_concurrency
@@ -125,12 +126,16 @@ def handler_class(base, config, root, *, phase="generate"):
             token = _case.set(context)
             started = time.monotonic()
             status = "inference_error"
+            diagnostic = {}
             try:
                 response = super().inference(
                     test_entry, include_input_log, exclude_state_log
                 )
                 status = "generated"
                 return response
+            except Exception as exc:
+                diagnostic = exception_details(exc)
+                raise
             finally:
                 _case.reset(token)
                 case_events.write(
@@ -138,6 +143,7 @@ def handler_class(base, config, root, *, phase="generate"):
                         **config.get("identity", {}),
                         "case_id": context["case_id"],
                         "status": status,
+                        **diagnostic,
                         "request_count": context["request_index"],
                         "started_monotonic": started,
                         "finished_monotonic": time.monotonic(),
@@ -201,6 +207,7 @@ def handler_class(base, config, root, *, phase="generate"):
                 except Exception as exc:
                     status = getattr(exc, "status_code", None)
                     event["error_type"] = type(exc).__name__
+                    event.update(exception_details(exc))
                     event["http_status"] = (
                         status if isinstance(status, int) else (200 if stream else None)
                     )
@@ -229,14 +236,18 @@ def handler_class(base, config, root, *, phase="generate"):
 
 
 def run_phase(phase, root):
+    def stage(name):
+        save_state(root / "runner_state.json", {"phase": phase, "stage": name})
+
+    stage("setup")
     config = json.loads((root / "config.json").read_text())
     manifest = config["manifest"]
     if manifest["revision"] != REVISION:
-        raise ValueError("BFCL manifest revision does not match pinned runner")
+        raise DiagnosticError("BFCL manifest revision does not match pinned runner", "manifest_revision_mismatch")
     if installed_revision() != REVISION:
-        raise ValueError("Install the pinned BFCL Git revision")
+        raise DiagnosticError("Install the pinned BFCL Git revision", "installed_revision_mismatch")
     if not 0 < config["timeout"] <= 3600:
-        raise ValueError("Request timeout must be within (0, 3600] seconds")
+        raise DiagnosticError("Request timeout must be within (0, 3600] seconds", "invalid_request_timeout")
     # Must precede every import from bfcl_eval; CLI invokes each phase separately.
     os.environ["BFCL_PROJECT_ROOT"] = str(root)
     from bfcl_eval.__main__ import cli
@@ -262,6 +273,7 @@ def run_phase(phase, root):
         (root / "test_case_ids_to_generate.json").write_text(
             json.dumps(manifest["cases"])
         )
+        stage("generate")
         started = time.monotonic()
         try:
             cli(
@@ -281,6 +293,7 @@ def run_phase(phase, root):
             if phase == "probe":
                 write_probe_report(root, manifest["cases"]["multi_turn_base"][0])
         wall_seconds = time.monotonic() - started
+        stage("validate_generated_cases")
         check_generated_cases(root / "result" / REGISTRY_KEY, manifest["cases"])
         if phase == "probe":
             return
@@ -288,7 +301,9 @@ def run_phase(phase, root):
             json.dumps({"wall_seconds": wall_seconds})
         )
     else:
+        stage("validate_generated_cases")
         check_generated_cases(root / "result" / REGISTRY_KEY, manifest["cases"])
+        stage("evaluate")
         started = time.monotonic()
         cli(
             [
@@ -301,6 +316,7 @@ def run_phase(phase, root):
             ],
             standalone_mode=False,
         )
+        stage("validate_scores")
         cases = score_results(root / "score" / REGISTRY_KEY, manifest["cases"])
         grading_seconds = time.monotonic() - started
         generation_seconds = json.loads((root / "generation.json").read_text())[
@@ -383,9 +399,13 @@ def main():
     try:
         run_phase(args.phase, root)
     except Exception as exc:
-        (root / "runner_error.json").write_text(
-            json.dumps({"phase": args.phase, "type": type(exc).__name__})
-        )
+        stage = "unknown"
+        try:
+            stage = json.loads((root / "runner_state.json").read_text()).get("stage", "unknown")
+        except (OSError, ValueError, AttributeError):
+            pass
+        save_state(root / "runner_error.json", {
+            "phase": args.phase, "stage": stage, **exception_details(exc)})
         raise
 
 

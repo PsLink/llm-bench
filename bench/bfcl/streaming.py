@@ -2,6 +2,7 @@
 
 import time
 
+from bench.bfcl.diagnostics import DiagnosticError
 from bench.cache_usage import cache_usage
 
 
@@ -63,7 +64,7 @@ def assemble_stream(chunks, *, started=None, deadline=None, clock=time.monotonic
     if deadline is not None and clock() >= deadline:
         raise TimeoutError("BFCL stream exceeded request deadline")
     if not choices or any(c["finish_reason"] is None for c in choices.values()):
-        raise ValueError("Incomplete completion stream")
+        raise DiagnosticError("Incomplete completion stream", "completion_stream_incomplete")
     result_choices = []
     for index, choice in sorted(choices.items()):
         message = {"role": "assistant", "content": "".join(choice["content"]) or None}

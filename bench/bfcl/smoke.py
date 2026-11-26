@@ -8,6 +8,7 @@ from collections import Counter
 from importlib.metadata import distribution
 from pathlib import Path
 
+from bench.bfcl.diagnostics import DiagnosticError
 from utils.api import join_endpoint, to_base_url
 
 REGISTRY_KEY = "llmbench-bfcl-smoke"
@@ -17,7 +18,8 @@ MANIFEST = Path(__file__).with_name("smoke-manifest.json")
 def category_output(root, category, kind):
     paths = list(root.rglob(f"BFCL_v4_{category}_{kind}.json"))
     if len(paths) != 1:
-        raise ValueError(f"Expected one BFCL {kind} file for {category}, found {len(paths)}")
+        raise DiagnosticError(f"Expected one BFCL {kind} file for {category}, found {len(paths)}",
+                              "generation_result_file_count", category=category, kind=kind, actual_count=len(paths))
     return paths[0]
 
 
@@ -28,9 +30,15 @@ def check_generated_cases(root, cases):
         with path.open(encoding="utf-8") as source:
             rows = [json.loads(line) for line in source if line.strip()]
         if Counter(row["id"] for row in rows) != Counter(expected):
-            raise ValueError(f"Unexpected case coverage for {category}")
+            raise DiagnosticError(f"Unexpected case coverage for {category}",
+                                  "generation_case_coverage_mismatch", category=category,
+                                  expected_count=len(expected), actual_count=len(rows),
+                                  missing_case_ids=sorted(set(expected) - {row["id"] for row in rows})[:10])
         if any("traceback" in row or "error" in row for row in rows):
-            raise ValueError(f"BFCL inference failed for {category}")
+            raise DiagnosticError(f"BFCL inference failed for {category}",
+                                  "generation_inference_failed", category=category,
+                                  failed_case_ids=[row["id"] for row in rows
+                                                   if "traceback" in row or "error" in row][:10])
 
 
 def installed_revision():
@@ -62,12 +70,12 @@ def main():
     # BFCL resolves this environment variable when importing its configuration.
     os.environ["BFCL_PROJECT_ROOT"] = str(root)
 
+    import httpx
     from bfcl_eval.__main__ import cli
     from bfcl_eval.constants.model_config import MODEL_CONFIG_MAPPING, ModelConfig
     from bfcl_eval.model_handler.api_inference.openai_completion import (
         OpenAICompletionsHandler,
     )
-    import httpx
 
     base_url = to_base_url(join_endpoint(args.endpoint, "chat/completions"))
     api_key = os.environ.get("BFCL_ENDPOINT_API_KEY")

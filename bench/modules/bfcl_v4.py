@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
-from pathlib import Path
 import signal
 import subprocess
 import time
+from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
 
+from bench.bfcl.diagnostics import EventSummary, exception_details, read_error, read_runner_state, save_state
 from bench.modules.base import (
     BenchmarkCancelled,
     BenchmarkTimeout,
@@ -26,6 +28,18 @@ from bench.modules.base import (
     TestModule,
     _noop_progress,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _checkpoint(progress_cb):
+    callback = getattr(progress_cb, "checkpoint", None)
+    if callback is not None:
+        try:
+            callback()
+        except Exception:
+            logger.warning("BFCL worker_log_checkpoint_failed")
+
 
 MANIFEST_DIR = Path(__file__).parents[1] / "bfcl"
 MANIFESTS = {
@@ -108,6 +122,11 @@ def run_process(command, *, env, deadline, cancel_event):
             raise BenchmarkTimeout("BFCL exceeded its total wall-clock budget")
 
     check()
+    phase = command[command.index("--phase") + 1] if "--phase" in command else "unknown"
+    root = Path(command[command.index("--root") + 1]) if "--root" in command else None
+    summary = EventSummary(root) if root else None
+    started = time.monotonic()
+    next_heartbeat = started + 30
     # Upstream may print prompts and credentials in exceptions. Only our typed
     # failure and sanitized event files are published, never raw child output.
     process = subprocess.Popen(
@@ -118,22 +137,41 @@ def run_process(command, *, env, deadline, cancel_event):
         stderr=None if env.get("BFCL_LOCAL_DEBUG") == "1" else subprocess.DEVNULL,
     )
     try:
+        logger.info("BFCL runner started phase=%s pid=%s", phase, process.pid)
         while process.poll() is None:
             check()
+            now = time.monotonic()
+            if summary is not None and now >= next_heartbeat:
+                logger.info("BFCL runner heartbeat phase=%s pid=%s elapsed_seconds=%.1f requests=%s",
+                            phase, process.pid, now - started, json.dumps(summary.poll()))
+                next_heartbeat = now + 30
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
         check()
         if process.returncode:
             raise RuntimeError(
-                f"BFCL runner exited with code {process.returncode}; inspect request events"
+                f"BFCL runner exited with code {process.returncode}; inspect worker diagnostics"
             )
     finally:
         if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 process.wait()
+        if root is not None:
+            save_state(root / "process_state.json", {
+                "phase": phase, "pid": process.pid, "exit_code": process.returncode,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            })
+        logger.info("BFCL runner exited phase=%s pid=%s exit_code=%s elapsed_seconds=%.1f",
+                    phase, process.pid, process.returncode, time.monotonic() - started)
 
 
 def _write_json(path, value):
@@ -243,6 +281,18 @@ class BFCLV4Module(TestModule):
         stop_reason = ""
         timed_out = False
         active_concurrency = None
+        point_states = {}
+
+        def checkpoint_scan(status):
+            snapshot = {"status": status, "concurrency_grid": grid,
+                        "active_concurrency": active_concurrency, "points": point_states}
+            save_state(root / "scan_state.json", snapshot)
+            compact = {name: {k: point[k] for k in ("status", "valid", "eligible", "error") if k in point}
+                       for name, point in point_states.items()}
+            logger.info("BFCL scan checkpoint %s", json.dumps({**snapshot, "points": compact}))
+            _checkpoint(progress_cb)
+
+        checkpoint_scan("running")
         try:
             for i, concurrency in enumerate(grid):
                 if cancel_event is not None and cancel_event.is_set():
@@ -258,11 +308,13 @@ class BFCLV4Module(TestModule):
                     "probe_endpoint": params.probe_endpoint and i == 0,
                 })
                 active_concurrency = concurrency
+                point_states[f"c{concurrency}"] = {"status": "running"}
+                checkpoint_scan("running")
+                def point_progress(fraction, message):
+                    progress_cb((i + fraction) / len(grid), f"c{concurrency}: {message}")
+                point_progress.checkpoint = lambda: _checkpoint(progress_cb)
                 child = self._run_single(
-                    endpoint, point, str(root / f"c{concurrency}"),
-                    lambda fraction, message, i=i, c=concurrency: progress_cb(
-                        (i + fraction) / len(grid), f"c{c}: {message}"),
-                    cancel_event,
+                    endpoint, point, str(root / f"c{concurrency}"), point_progress, cancel_event,
                 )
                 required = ["total_tpm", *[c["key"] for c in point_configs
                                          if c.get("role") in ("score", "redline")]]
@@ -277,9 +329,19 @@ class BFCLV4Module(TestModule):
                 if not valid:
                     error = child.error or "Missing required point metrics"
                     levels[f"c{concurrency}"]["error"] = error
-                    _write_json(root / f"c{concurrency}" / "failure.json", {"error": error})
+                    save_state(root / f"c{concurrency}" / "failure.json", {
+                        "error": error, "concurrency": concurrency,
+                        "diagnostic": child.metrics.get("diagnostic"),
+                    })
+                point_states[f"c{concurrency}"] = {
+                    "status": "completed" if valid else child.metrics.get("diagnostic", {}).get("status", "failed"),
+                    **levels[f"c{concurrency}"]}
+                logger.log(logging.INFO if valid else logging.ERROR,
+                           "BFCL concurrency point finished concurrency=%s state=%s",
+                           concurrency, json.dumps(point_states[f"c{concurrency}"]))
                 result.metrics.update(levels)
                 active_concurrency = None
+                checkpoint_scan("running")
             if cancel_event is not None and cancel_event.is_set():
                 raise BenchmarkCancelled("BFCL scan canceled")
         except BenchmarkCancelled as exc:
@@ -294,8 +356,14 @@ class BFCLV4Module(TestModule):
                 levels[f"c{active_concurrency}"] = {
                     "valid": 0, "eligible": 0, "case_concurrency": active_concurrency,
                     "error": stop_reason,
+                    "diagnostic": getattr(exc, "diagnostic", None),
                 }
                 result.metrics.update(levels)
+                point_states[f"c{active_concurrency}"] = {
+                    "status": "timed_out" if timed_out else "canceled",
+                    **levels[f"c{active_concurrency}"]}
+                save_state(root / f"c{active_concurrency}" / "failure.json",
+                           point_states[f"c{active_concurrency}"])
         finally:
             # Keep a representative even on cancellation for diagnostics; the
             # cancellation flag always prevents it from ranking or becoming a best level.
@@ -323,6 +391,8 @@ class BFCLV4Module(TestModule):
                 for level, values in levels.items() for metric, value in values.items()
                 if isinstance(value, (int, float))
             ]
+            checkpoint_scan("canceled" if canceled else "timed_out" if timed_out else
+                            "completed" if complete else "partial_failure")
             protocol = {"params": params.model_dump(exclude_none=True), "redlines": configs}
             _write_json(root / "scan.json", {
                 "protocol_hash": hashlib.sha256(json.dumps(
@@ -359,6 +429,18 @@ class BFCLV4Module(TestModule):
         probe_config_path = probe_root / "config.json"
         result = ModuleResult(artifacts=[str(index)])
         canceled = None
+        phase = "setup"
+        phase_root = root
+        status = "running"
+        runner_active = False
+        parent_error = None
+        identity = {k: v for k, v in getattr(endpoint, "run_context", {}).items()
+                    if k in {"submission_id", "module_run_id"}}
+        context = {**identity, "attempt_id": attempt, "concurrency": params.concurrency,
+                   "task_set": params.task_set}
+        logger.info("BFCL attempt started context=%s request_timeout_seconds=%s max_seconds=%s retries=%s",
+                    json.dumps(context), params.request_timeout_seconds, params.max_seconds, params.request_retries)
+        save_state(root / "state.json", {**context, "status": status, "phase": phase})
         try:
             url = urlsplit(endpoint.api_url)
             if url.username or url.password or url.query or url.fragment:
@@ -376,6 +458,9 @@ class BFCLV4Module(TestModule):
                     ]
                     for category in manifest["cases"]
                 }
+            logger.info("BFCL cases selected context=%s case_count=%s categories=%s",
+                        json.dumps(context), sum(len(ids) for ids in manifest["cases"].values()),
+                        ",".join(manifest["cases"]))
             manifest.update(
                 concurrency=params.concurrency,
                 handler_version="llmbench-stream-v2",
@@ -441,7 +526,11 @@ class BFCLV4Module(TestModule):
                 probe_config_path.chmod(0o600)
                 phases.insert(0, ("probe", 0.02, probe_root))
             for phase, fraction, phase_root in phases:
+                save_state(root / "state.json", {**context, "status": status, "phase": phase})
+                logger.info("BFCL phase started context=%s phase=%s", json.dumps(context), phase)
+                phase_started = time.monotonic()
                 progress_cb(fraction, f"BFCL {phase}")
+                runner_active = True
                 run_process(
                     [
                         python,
@@ -456,6 +545,11 @@ class BFCLV4Module(TestModule):
                     deadline=deadline,
                     cancel_event=cancel_event,
                 )
+                runner_active = False
+                logger.info("BFCL phase completed context=%s phase=%s elapsed_seconds=%.1f requests=%s",
+                            json.dumps(context), phase, time.monotonic() - phase_started,
+                            json.dumps(EventSummary(phase_root).poll()))
+            phase = "validate_metrics"
             result.metrics = json.loads((root / "summary.json").read_text())["metrics"]
             for key in params.required_metrics:
                 value = result.metrics.get(key)
@@ -471,26 +565,50 @@ class BFCLV4Module(TestModule):
                     raise ValueError(f"BFCL telemetry coverage below threshold: {key}")
             if time.monotonic() >= deadline:
                 raise BenchmarkTimeout("BFCL exceeded its total wall-clock budget")
+            logger.info("BFCL metrics context=%s metrics=%s", json.dumps(context), json.dumps(result.metrics))
             progress_cb(1, "BFCL complete")
+            status = "completed"
         except BenchmarkCancelled as exc:
             canceled = exc
+            parent_error = exception_details(exc)
             result.error = "BFCL canceled"
+            timeout_event = getattr(cancel_event, "bfcl_timeout_event", None)
+            status = "timed_out" if timeout_event is not None and timeout_event.is_set() else "canceled"
         except Exception as exc:
+            parent_error = exception_details(exc)
+            status = "timed_out" if isinstance(exc, BenchmarkTimeout) else "failed"
             # Do not persist arbitrary upstream messages (may include the key).
             result.error = (
                 str(exc)
                 if isinstance(exc, (ValueError, BenchmarkTimeout, RuntimeError))
                 else f"BFCL {type(exc).__name__}"
             )
-            diagnostic = root / "runner_error.json"
-            if not diagnostic.is_file():
-                diagnostic = probe_root / "runner_error.json"
-            if diagnostic.is_file():
-                error = json.loads(diagnostic.read_text())
-                result.error += f" ({error['phase']}: {error['type']})"
-            if endpoint.api_key:
-                result.error = result.error.replace(endpoint.api_key, "[REDACTED]")
         finally:
+            diagnostic = None
+            if result.error:
+                if runner_active:
+                    diagnostic = read_error(phase_root)
+                    if diagnostic.get("phase", phase) != phase:
+                        diagnostic = {"code": "diagnostic_stale"}
+                    if "type" in diagnostic:
+                        result.error += f" ({diagnostic.get('phase', phase)}: {diagnostic['type']})"
+                else:
+                    diagnostic = {**(parent_error or {}), "code": "parent_failure", "phase": phase}
+                if endpoint.api_key:
+                    result.error = result.error.replace(endpoint.api_key, "[REDACTED]")
+            snapshot = {**context, "status": status, "phase": phase,
+                        "elapsed_seconds": round(time.monotonic() - started, 3),
+                        "requests": EventSummary(phase_root).poll(), "error": result.error}
+            if result.error:
+                snapshot["diagnostic"] = diagnostic
+                if runner_active:
+                    snapshot["runner_state"] = read_runner_state(phase_root, "runner_state.json", phase)
+                    snapshot["process_state"] = read_runner_state(phase_root, "process_state.json", phase)
+                result.metrics["diagnostic"] = snapshot
+            save_state(root / "state.json", snapshot)
+            logger.log(logging.ERROR if result.error else logging.INFO,
+                       "BFCL attempt finished %s", json.dumps(snapshot))
+            _checkpoint(progress_cb)
             config_path.unlink(missing_ok=True)
             probe_config_path.unlink(missing_ok=True)
             _write_json(
@@ -508,5 +626,7 @@ class BFCLV4Module(TestModule):
             )
         if canceled:
             canceled.artifacts = result.artifacts
+            canceled.diagnostic = result.metrics.get("diagnostic")
+            canceled.partial_result = result
             raise canceled
         return result

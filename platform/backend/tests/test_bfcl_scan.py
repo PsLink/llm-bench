@@ -319,3 +319,37 @@ def test_submit_rejects_changed_or_combined_scan_protocol_before_creating_rows(m
         else:
             raise AssertionError("a changed or combined scan protocol must be rejected")
         session.add.assert_not_called()
+
+
+def test_failed_point_flushes_downloadable_log_before_next_point(tmp_path, monkeypatch):
+    import logging
+    from unittest.mock import patch
+
+    from app.queue import log_capture
+    from bench.modules.bfcl_v4 import BFCLV4Module, BFCLV4Params
+
+    monkeypatch.setenv("BFCL_PYTHON", sys.executable)
+    monkeypatch.setattr(jobs.settings, "BFCL_ARTIFACT_DIR", "")
+    monkeypatch.setattr(jobs, "_publish_progress_event", lambda *args: None)
+    stored = []
+    monkeypatch.setattr(log_capture, "_persist", lambda sid, buffer: stored.append(buffer.getvalue()[0]))
+    callback = jobs._make_progress_cb(41, 42, "bfcl_v4", threading.Event())
+
+    def process(command, **kwargs):
+        root = Path(command[-1])
+        config = json.loads((root / "config.json").read_text())
+        if config["concurrency"] == 1:
+            (root / "runner_error.json").write_text('{"phase":"generate","type":"ValueError"}')
+            raise RuntimeError("BFCL runner exited with code 1")
+        assert stored and "ValueError" in stored[-1]
+        assert '"c1": {"status": "failed"' in stored[-1]
+        if command[-3] == "evaluate":
+            (root / "summary.json").write_text('{"metrics":{"accuracy":1,"total_tpm":10}}')
+
+    with patch("bench.modules.bfcl_v4.run_process", side_effect=process), patch.object(
+        logging.getLogger(), "level", logging.INFO
+    ), log_capture.capture_submission_logs(41, "attempt 1", carry_prior=False):
+        result = BFCLV4Module().run(EndpointConfig("http://localhost/v1", "m"),
+                                  BFCLV4Params(concurrency_grid=[1, 2]), tmp_path, callback)
+    assert result.error is None
+    assert result.metrics["c1"]["diagnostic"]["diagnostic"]["type"] == "ValueError"

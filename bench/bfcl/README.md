@@ -314,3 +314,46 @@ ordered requests within a case, usage/cache telemetry, and the optional probe.
 It covers dotted function names in single-tool, tool-selection, and parallel
 calls. This fixture check does not replace validation against the target model
 endpoint.
+
+## Failure diagnostics without artifact storage
+
+The submission's downloadable worker log includes attempt identity, concurrency,
+case counts, timeout/retry settings, phase start/end, runner PID/exit code and
+30-second request/case progress summaries. Failed requests include HTTP status,
+exception type, safe error codes, and up to five examples with case/request IDs
+and stack-frame locations. Stack source text, local variables, exception messages
+from upstream, prompts and response bodies are not included.
+
+Each attempt atomically updates `state.json`; the child records
+`runner_state.json`, `runner_error.json`, and the parent records
+`process_state.json`. Generation coverage failures identify the category and
+missing/failed case IDs. Missing or partially written diagnostic files are
+reported without replacing the original failure. Cancellation and timeout also
+write terminal snapshots.
+
+When a runner is terminated before it can write an error file, the failure
+snapshot still includes `runner_state` (the last stage) and `process_state`
+(PID and exit code), when available. Negative exit codes identify termination
+signals; they do not establish that the process ran out of memory. Parent-side
+setup or metric validation errors use `diagnostic.code: parent_failure` rather
+than reporting a missing runner error.
+
+Concurrency scans update `scan_state.json` before and after every point and
+immediately checkpoint the submission log to the database. A failed point's
+snapshot is retained in `metrics.cN.diagnostic` when the module result is saved,
+even if a later point succeeds and the overall submission passes. Failure
+snapshots include the phase, elapsed time, event counts, failure samples and
+runner diagnostic; `cN/failure.json` retains the local point failure. These logs
+and result metadata do not require `BFCL_ARTIFACT_DIR`. Local JSON files follow
+the worker's existing output-directory retention policy; configured artifact
+storage remains necessary for durable access to all raw artifacts.
+
+Scan checkpoint log entries contain compact point status, validity, eligibility,
+and error summaries. Full metrics and diagnostics remain in `scan_state.json`
+and the module result rather than being repeated at every checkpoint.
+
+For `generate: ValueError`, first inspect `diagnostic.stage` and the error code:
+`generation_inference_failed` means generated records contain failures;
+`generation_case_coverage_mismatch` means selected cases are missing or duplicated;
+`completion_stream_incomplete` identifies a response without a complete finish.
+Unknown upstream exceptions retain their type and stack-frame locations.
