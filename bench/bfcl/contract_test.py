@@ -29,6 +29,10 @@ def main():
             assert self.headers["Authorization"] == "Bearer fixture-key"
             messages = body["messages"]
             tool_names = {tool["function"]["name"] for tool in body.get("tools", [])}
+            if "determine_body_mass_index" in tool_names:
+                # The first irrelevance case must be scored as a request failure.
+                self.send_error(503)
+                return
             triangle = "calculate_triangle_area" in tool_names
             multi_turn = "pwd" in tool_names
             if fail_multi_turn and multi_turn:
@@ -202,6 +206,7 @@ def main():
                     task_set="bfcl-v4-tool-use-v1",
                     cases_per_category=2,
                     probe_endpoint=True,
+                    allow_request_failures=True,
                 ),
                 directory,
             )
@@ -212,6 +217,7 @@ def main():
             assert expanded.metrics["accuracy_simple_python"] == 1, expanded.metrics
             assert expanded.metrics["accuracy_multiple"] == 1, expanded.metrics
             assert expanded.metrics["accuracy_parallel"] == 0.5, expanded.metrics
+            assert expanded.metrics["accuracy_irrelevance"] == 0.5, expanded.metrics
             for category in (
                 "simple_python",
                 "multiple",
@@ -221,6 +227,22 @@ def main():
             ):
                 assert expanded.metrics[f"case_count_{category}"] == 2
             expanded_attempt = Path(expanded.artifacts[0]).parent
+            expanded_cases = [
+                json.loads(line)
+                for line in (expanded_attempt / "case_results.jsonl").read_text().splitlines()
+            ]
+            irrelevance = {
+                row["case_id"]: row for row in expanded_cases if row["category"] == "irrelevance"
+            }
+            assert irrelevance["irrelevance_0"]["request_failed"] is True
+            assert irrelevance["irrelevance_0"]["success"] is False
+            assert irrelevance["irrelevance_1"]["success"] is True
+            assert not irrelevance["irrelevance_1"].get("request_failed")
+            passed = 1 + sum(
+                row["success"] for row in expanded_cases if row["category"] != "irrelevance"
+            )
+            assert expanded.metrics["case_success_count"] == passed
+            assert expanded.metrics["accuracy"] == passed / 10
             manifest = json.loads((expanded_attempt / "manifest.json").read_text())
             assert manifest["handler_version"] == "llmbench-stream-v2"
             assert all(

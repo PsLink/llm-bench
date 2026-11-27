@@ -428,8 +428,8 @@ def run_phase(phase, root):
             for case in cases:
                 timing = case_timing[case["case_id"]]
                 if case["case_id"] in failed_cases:
-                    if case["success"]:
-                        raise ValueError("BFCL scorer accepted a case interrupted by a request failure")
+                    # BFCL can accept an inference error as no tool call in irrelevance cases.
+                    case["success"] = False
                     case["request_failed"] = True
                 case["request_count"] = timing["request_count"]
                 case["wall_seconds"] = (
